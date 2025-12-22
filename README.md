@@ -77,4 +77,5 @@ This project is licensed under the **GNU Affero General Public License v3.0 (AGP
 *   **Open Source**: You can modify and distribute the code.
 *   **Copyleft**: If you modify this software and distribute it (or host it as a SaaS), you **must** release your source code under the same license.
 
+Note: I am open to extending custom licenses if this one does not suit your needs. I support open source. If you are an open source developer and would like to work under different terms, please contact me. If you are a business and would like to discuss an agreement, contact me. I can be reached via pluskittydev [at] gmail [dot] com
 See the [LICENSE](LICENSE) file for details.
