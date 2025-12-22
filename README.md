@@ -1,4 +1,4 @@
-# <img src="app/public/icon.png" width="40" height="40" style="vertical-align: middle;"> PDFTwice
+# <img src="app/public/icon.png" width="40" height="40" style="vertical-align: text-bottom;"> PDFTwice
 
 ![PDFTwice Screenshot](app/public/screenshot/Main%20view.png)
 
