@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Lock, Unlock, MessageSquare, X, Download, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, RotateCcw, Settings, AlertTriangle, Trash2, Search } from 'lucide-react';
+import { Upload, Lock, Unlock, MessageSquare, X, Download, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, RotateCcw, Settings, AlertTriangle, Trash2, Search, Loader2 } from 'lucide-react';
 
 const PDFViewer = ({
     pdf,
@@ -29,7 +29,8 @@ const PDFViewer = ({
     authorName,
     setAuthorName,
     onClose,
-    onLoadFromUrl
+    onLoadFromUrl,
+    isLoading = false
 }) => {
     const numPages = pdf?.numPages || 0;
     const [selectionBtn, setSelectionBtn] = useState({ show: false, x: 0, y: 0 });
@@ -534,14 +535,15 @@ const PDFViewer = ({
                             </div>
                         ) : (
                             <>
-                                <label className="cursor-pointer flex flex-col items-center gap-3 p-8 border-2 border-dashed border-gray-400 rounded-lg hover:border-blue-500 hover:bg-blue-50 transition-colors">
-                                    <Upload className="w-12 h-12 text-gray-400" />
-                                    <span className="text-gray-600 font-medium">Upload PDF</span>
+                                <label className={`cursor-pointer flex flex-col items-center gap-3 p-8 border-2 border-dashed rounded-lg transition-colors ${isLoading ? 'border-gray-200 bg-gray-50 cursor-wait' : 'border-gray-400 hover:border-blue-500 hover:bg-blue-50'}`}>
+                                    <Upload className={`w-12 h-12 ${isLoading ? 'text-gray-300' : 'text-gray-400'}`} />
+                                    <span className={`font-medium ${isLoading ? 'text-gray-400' : 'text-gray-600'}`}>{isLoading ? 'Uploading PDF...' : 'Upload PDF'}</span>
                                     <input
                                         type="file"
                                         accept="application/pdf"
                                         onChange={onUpload}
                                         className="hidden"
+                                        disabled={isLoading}
                                     />
                                 </label>
 
@@ -563,13 +565,16 @@ const PDFViewer = ({
                                         name="url"
                                         type="text"
                                         placeholder="https://... or C:\..."
-                                        className="flex-1 text-xs border border-gray-300 rounded px-2 py-2 focus:outline-none focus:ring-1 focus:ring-blue-500 shadow-sm"
+                                        disabled={isLoading}
+                                        className="flex-1 text-xs border border-gray-300 rounded px-2 py-2 focus:outline-none focus:ring-1 focus:ring-blue-500 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
                                     />
                                     <button
                                         type="submit"
-                                        className="bg-gray-900 text-white text-xs font-medium px-4 py-2 rounded hover:bg-gray-800 transition-colors shadow-sm"
+                                        disabled={isLoading}
+                                        className="bg-gray-900 text-white text-xs font-medium px-4 py-2 rounded hover:bg-gray-800 transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
                                     >
-                                        Load
+                                        {isLoading && <Loader2 className="w-3 h-3 animate-spin" />}
+                                        {isLoading ? 'Loading...' : 'Load'}
                                     </button>
                                 </form>
                             </>

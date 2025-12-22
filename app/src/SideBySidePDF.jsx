@@ -19,6 +19,7 @@ export default function SideBySidePDF() {
     const [isDirty, setIsDirty] = useState(false);
     const [loadingError, setLoadingError] = useState(null);
     const [closeConfirmSide, setCloseConfirmSide] = useState(null);
+    const [isUrlLoading, setIsUrlLoading] = useState({ left: false, right: false });
 
     // Update URL without reloading
     const updateUrlParams = (side, url) => {
@@ -34,21 +35,70 @@ export default function SideBySidePDF() {
     // URL Loading Logic
     const loadPDFFromURL = useCallback(async (url, side) => {
         if (!url || !pdfjsLoaded) return;
+        setIsUrlLoading(prev => ({ ...prev, [side]: true }));
 
         try {
             let fetchUrl = url;
-            // Detect local paths (e.g. C:\ or D:\) or path traversal hints
-            if (/^[a-zA-Z]:\\/.test(url) || url.startsWith('\\\\') || !url.startsWith('http') && !url.startsWith('/')) {
+            // Validate input
+            if (!url || typeof url !== 'string') return;
+
+            // Detect if it's a likely URL or local path
+            const isUrl = /^(https?:\/\/)/i.test(url);
+            const isLocalPath = /^[a-zA-Z]:\\/.test(url) || url.startsWith('\\\\') || url.startsWith('/');
+
+            if (!isUrl && !isLocalPath) {
+                // If it's just a random string like "d" and not a path/url, probably garbage input
+                throw new Error("Invalid URL or file path. Please enter a valid http/https URL or local file path.");
+            }
+
+            if (isLocalPath && !url.startsWith('http')) {
+                fetchUrl = `/api/pdf?path=${encodeURIComponent(url)}`;
+            } else if (import.meta.env.DEV && isUrl) {
+                // In local development, use our own Vite proxy to bypass CORS
+                console.log("Using local Vite proxy for:", url);
                 fetchUrl = `/api/pdf?path=${encodeURIComponent(url)}`;
             }
 
-            const response = await fetch(fetchUrl);
-            if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(`${response.status} ${response.statusText}${errorText ? ': ' + errorText : ''}`);
+            const fetchPDF = async (targetUrl, useProxy = false) => {
+                const finalUrl = useProxy
+                    ? `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`
+                    : targetUrl;
+
+                const res = await fetch(finalUrl);
+                const cType = res.headers.get('content-type');
+
+                if (!res.ok) {
+                    // If it's a 404/local error, don't retry with proxy
+                    if (res.status === 404 || res.status === 403) {
+                        const txt = await res.text();
+                        throw new Error(`HTTP ${res.status}: ${txt ? txt.substring(0, 50) : res.statusText}`);
+                    }
+                    throw new Error('Network response not ok');
+                }
+
+                if (cType && cType.includes('text/html')) {
+                    throw new Error("The URL returned a web page instead of a PDF.");
+                }
+
+                return res.arrayBuffer();
             }
 
-            const arrayBuffer = await response.arrayBuffer();
+            let arrayBuffer;
+            try {
+                arrayBuffer = await fetchPDF(fetchUrl, false);
+            } catch (initialErr) {
+                // If it's a URL (not local path) and network error, try proxy
+                if (isUrl && !fetchUrl.includes('api/pdf')) {
+                    try {
+                        console.log("Direct fetch failed, trying CORS proxy...");
+                        arrayBuffer = await fetchPDF(fetchUrl, true);
+                    } catch (proxyErr) {
+                        throw new Error(`Failed to load PDF. Possible CORS restriction. Try downloading the file and uploading it manually. (${initialErr.message})`);
+                    }
+                } else {
+                    throw initialErr;
+                }
+            }
             const pdfDoc = await window.pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
 
             const pdfData = {
@@ -73,6 +123,8 @@ export default function SideBySidePDF() {
                 url,
                 message: err.message
             });
+        } finally {
+            setIsUrlLoading(prev => ({ ...prev, [side]: false }));
         }
     }, [pdfjsLoaded]);
 
@@ -327,10 +379,12 @@ export default function SideBySidePDF() {
     const handleFileUpload = async (e, side) => {
         const file = e.target.files[0];
         if (!file) return;
+        setIsUrlLoading(prev => ({ ...prev, [side]: true }));
 
         if (!pdfjsLoaded || !window.pdfjsLib) {
             console.error('PDF.js lib not loaded');
             alert('PDF engine is not ready yet. Please wait a moment.');
+            setIsUrlLoading(prev => ({ ...prev, [side]: false }));
             return;
         }
 
@@ -479,6 +533,8 @@ export default function SideBySidePDF() {
         } catch (error) {
             console.error('Error loading PDF:', error);
             alert('Failed to load PDF. Please try again.');
+        } finally {
+            setIsUrlLoading(prev => ({ ...prev, [side]: false }));
         }
     };
 
@@ -816,6 +872,7 @@ export default function SideBySidePDF() {
                     setAuthorName={setAuthorName}
                     onClose={() => handleCloseRequest('left')}
                     onLoadFromUrl={(url) => loadPDFFromURL(url, 'left')}
+                    isLoading={isUrlLoading.left}
                 />
                 <PDFViewer
                     pdf={rightPDF}
@@ -844,6 +901,7 @@ export default function SideBySidePDF() {
                     setAuthorName={setAuthorName}
                     onClose={() => handleCloseRequest('right')}
                     onLoadFromUrl={(url) => loadPDFFromURL(url, 'right')}
+                    isLoading={isUrlLoading.right}
                 />
             </div>
 

@@ -27,6 +27,25 @@ export default defineConfig({
                 return;
               }
 
+              // 0. Handle Remote URLs (Proxy)
+              if (rawPath.startsWith('http://') || rawPath.startsWith('https://')) {
+                console.log('Proxying remote PDF:', rawPath);
+                const remoteRes = await fetch(rawPath);
+                if (!remoteRes.ok) {
+                  res.statusCode = remoteRes.status;
+                  res.end('Remote fetch failed: ' + remoteRes.statusText);
+                  return;
+                }
+                const arrayBuffer = await remoteRes.arrayBuffer();
+                const buffer = Buffer.from(arrayBuffer);
+
+                res.setHeader('Content-Type', 'application/pdf');
+                res.setHeader('Content-Length', buffer.length);
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.end(buffer);
+                return;
+              }
+
               // Security & Sanitization
               // Remove null bytes
               const sanitizedInput = rawPath.replace(/\0/g, '');
@@ -44,7 +63,7 @@ export default defineConfig({
               }
 
               // 2. Safe Root enforcement (Traversal protection)
-              if (!resolvedPath.startsWith(SAFE_ROOT)) {
+              if (!resolvedPath.startsWith(SAFE_ROOT) && !path.isAbsolute(sanitizedInput)) {
                 res.statusCode = 403;
                 res.end('Forbidden: Access outside of safe root');
                 return;
