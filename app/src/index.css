@@ -1,3 +1,53 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/**
+ * REFINED FIX: PDF Selection Flicker
+ * Instead of giving text layer elements a huge height (which breaks coordinate calculations),
+ * we use an invisible pseudo-element overlay.
+ * This catches pointer events between gaps/lines during selection without affecting
+ * the element's layout height or Range.getBoundingClientRect().
+ * 
+ * NOTE: TEMPORARILY DISABLED to test text layer alignment issues
+ */
+/*
+.textLayer>div,
+.textLayer>span {
+    height: auto !important;
+}
+
+.textLayer>div::after,
+.textLayer>span::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 150px;
+    pointer-events: auto;
+    z-index: -1;
+}
+
+.textLayer>br {
+    display: none !important;
+}
+*/
+
+@keyframes border-blink {
+
+    0%,
+    100% {
+        border-color: transparent;
+        border-width: 1px;
+    }
+
+    50% {
+        border-color: #f97316;
+        border-width: 2px;
+    }
+}
+
+.animate-border-blink {
+    animation: border-blink 0.3s ease-in-out 2;
+}

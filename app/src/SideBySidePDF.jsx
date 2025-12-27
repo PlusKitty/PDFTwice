@@ -1,7 +1,58 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { AlertCircle } from 'lucide-react';
-import { PDFDocument, StandardFonts, PDFName, PDFArray, PDFNumber, PDFString, PDFHexString } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFArray, PDFString } from 'pdf-lib';
+import { AlertTriangle, X } from 'lucide-react';
+import * as pdfjsLib from 'pdfjs-dist';
+import 'pdfjs-dist/web/pdf_viewer.css';
 import PDFViewer from './PDFViewer';
+
+// Setup local worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+    'pdfjs-dist/build/pdf.worker.min.js',
+    import.meta.url
+).toString();
+
+const fetchPDF = async (targetUrl, proxyType = null) => {
+    const allowRemote = import.meta.env.VITE_ENABLE_REMOTE_PDFS !== 'false';
+    const isRemoteUrl = /^(https?:\/\/)/i.test(targetUrl) && !targetUrl.includes('/api/pdf');
+
+    if (isRemoteUrl && !allowRemote) {
+        throw new Error("Direct remote fetch is disabled by security policy.");
+    }
+
+    let res;
+    try {
+        res = await fetch(targetUrl);
+    } catch (e) {
+        // TypeError: Failed to fetch (CORS block, DNS failure, etc.)
+        const err = new Error("Network Error (Possibly CORS or DNS failure)");
+        err.type = 'NETWORK_ERROR';
+        throw err;
+    }
+
+    if (!res.ok) {
+        let errorMsg = `HTTP ${res.status}: ${res.statusText}`;
+        try {
+            const txt = await res.text();
+            // Only append body if it provides specific info (e.g. security block or file type error)
+            // and isn't just the generic "could not be fetched" fallback.
+            if (txt && !txt.includes('could not be fetched')) {
+                errorMsg += ` - ${txt.substring(0, 100)}`;
+            }
+        } catch (e) { }
+
+        const err = new Error(errorMsg);
+        err.type = 'HTTP_ERROR';
+        err.status = res.status;
+        throw err;
+    }
+
+    const cType = res.headers.get('content-type');
+    if (cType && cType.includes('text/html') && !proxyType) {
+        throw new Error("The URL returned a web page instead of a PDF.");
+    }
+
+    return res.arrayBuffer();
+};
 
 export default function SideBySidePDF() {
     const [leftPDF, setLeftPDF] = useState(null);
@@ -11,101 +62,196 @@ export default function SideBySidePDF() {
     const [leftScale, setLeftScale] = useState(1.0);
     const [rightScale, setRightScale] = useState(1.0);
     const [syncScroll, setSyncScroll] = useState(true);
+    const [syncOffset, setSyncOffset] = useState(0);
     const [comments, setComments] = useState({});
-    const [activeComment, setActiveComment] = useState(null);
-    const [commentText, setCommentText] = useState('');
-    const [pdfjsLoaded, setPdfjsLoaded] = useState(false);
+    const [leftActiveComment, setLeftActiveComment] = useState(null);
+    const [leftCommentText, setLeftCommentText] = useState('');
+    const [rightActiveComment, setRightActiveComment] = useState(null);
+    const [rightCommentText, setRightCommentText] = useState('');
     const [authorName, setAuthorName] = useState(() => localStorage.getItem('pdf_author_name') || 'User');
     const [isDirty, setIsDirty] = useState(false);
     const [loadingError, setLoadingError] = useState(null);
-    const [closeConfirmSide, setCloseConfirmSide] = useState(null);
     const [isUrlLoading, setIsUrlLoading] = useState({ left: false, right: false });
+
+    const [viewMode, setViewMode] = useState(() => localStorage.getItem('pdf_view_mode') || 'single');
+
+    const handleSetViewMode = (mode) => {
+        setViewMode(mode);
+        localStorage.setItem('pdf_view_mode', mode);
+    };
+
+    // DOM Refs for direct access (legacy sync + bounding box)
+    const leftViewerRef = useRef(null);
+    const rightViewerRef = useRef(null);
+
+    // Component Refs for API access (new sync)
+    const leftComponentRef = useRef(null);
+    const rightComponentRef = useRef(null);
+
+    const isSyncingLeft = useRef(false);
+    const isSyncingRight = useRef(false);
+    const leftSyncTimeoutRef = useRef(null);
+    const rightSyncTimeoutRef = useRef(null);
+
+    // RAF throttling for smooth scroll sync
+    const syncRAFRef = useRef(null);
+    const pendingSyncRef = useRef(null);
 
     // Update URL without reloading
     const updateUrlParams = (side, url) => {
         const urlObj = new URL(window.location);
+        const paramKey = side === 'left' ? 'a' : 'b';
         if (url) {
-            urlObj.searchParams.set(side, url);
+            urlObj.searchParams.set(paramKey, url);
         } else {
-            urlObj.searchParams.delete(side);
+            urlObj.searchParams.delete(paramKey);
         }
         window.history.pushState({}, '', urlObj);
     };
 
-    // URL Loading Logic
-    const loadPDFFromURL = useCallback(async (url, side) => {
-        if (!url || !pdfjsLoaded) return;
+    const loadPDFFromURL = useCallback(async (originalUrl, side) => {
+        if (!originalUrl) return;
+
+        const url = originalUrl.trim();
+        const allowRemote = import.meta.env.VITE_ENABLE_REMOTE_PDFS !== 'false';
+        const allowLocal = import.meta.env.VITE_ENABLE_LOCAL_BRIDGE !== 'false';
+        const endsWithPdf = url.toLowerCase().endsWith('.pdf');
+
+        // Strict protocol detection (filenames can contain 'http')
+        const isRemoteCandidate = url.startsWith('http://') || url.startsWith('https://');
+        const isLocalCandidate = !isRemoteCandidate;
+
+        if (isRemoteCandidate && !allowRemote) {
+            setLoadingError({
+                side,
+                url,
+                message: "Remote PDF loading is disabled by configuration. Please upload the file manually or use a local path."
+            });
+            return;
+        }
+
+        if (isLocalCandidate) {
+            if (!allowLocal) {
+                setLoadingError({
+                    side,
+                    url,
+                    message: "Local file bridge is disabled by configuration. Please upload the file manually."
+                });
+                return;
+            }
+
+            // Local files must end in .pdf
+            if (!endsWithPdf) {
+                setLoadingError({
+                    side,
+                    url,
+                    message: "Invalid local path. Local files must end in .pdf to be loaded."
+                });
+                return;
+            }
+        }
+
         setIsUrlLoading(prev => ({ ...prev, [side]: true }));
 
         try {
             let fetchUrl = url;
-            // Validate input
-            if (!url || typeof url !== 'string') return;
 
-            // Detect if it's a likely URL or local path
-            const isUrl = /^(https?:\/\/)/i.test(url);
-            const isLocalPath = /^[a-zA-Z]:\\/.test(url) || url.startsWith('\\\\') || url.startsWith('/');
-
-            if (!isUrl && !isLocalPath) {
-                // If it's just a random string like "d" and not a path/url, probably garbage input
-                throw new Error("Invalid URL or file path. Please enter a valid http/https URL or local file path.");
-            }
-
-            if (isLocalPath && !url.startsWith('http')) {
-                fetchUrl = `/api/pdf?path=${encodeURIComponent(url)}`;
-            } else if (import.meta.env.DEV && isUrl) {
-                // In local development, use our own Vite proxy to bypass CORS
-                console.log("Using local Vite proxy for:", url);
+            // Route logic
+            if (isRemoteCandidate) {
+                if (import.meta.env.DEV) {
+                    fetchUrl = `/api/pdf?path=${encodeURIComponent(url)}`;
+                }
+                // In PROD, we might use SideBySidePDF's fetchPDF logic which handles direct/proxy
+            } else {
                 fetchUrl = `/api/pdf?path=${encodeURIComponent(url)}`;
             }
 
-            const fetchPDF = async (targetUrl, useProxy = false) => {
-                const finalUrl = useProxy
-                    ? `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`
-                    : targetUrl;
-
-                const res = await fetch(finalUrl);
-                const cType = res.headers.get('content-type');
-
-                if (!res.ok) {
-                    // If it's a 404/local error, don't retry with proxy
-                    if (res.status === 404 || res.status === 403) {
-                        const txt = await res.text();
-                        throw new Error(`HTTP ${res.status}: ${txt ? txt.substring(0, 50) : res.statusText}`);
-                    }
-                    throw new Error('Network response not ok');
-                }
-
-                if (cType && cType.includes('text/html')) {
-                    throw new Error("The URL returned a web page instead of a PDF.");
-                }
-
-                return res.arrayBuffer();
-            }
 
             let arrayBuffer;
-            try {
-                arrayBuffer = await fetchPDF(fetchUrl, false);
-            } catch (initialErr) {
-                // If it's a URL (not local path) and network error, try proxy
-                if (isUrl && !fetchUrl.includes('api/pdf')) {
-                    try {
-                        console.log("Direct fetch failed, trying CORS proxy...");
-                        arrayBuffer = await fetchPDF(fetchUrl, true);
-                    } catch (proxyErr) {
-                        throw new Error(`Failed to load PDF. Possible CORS restriction. Try downloading the file and uploading it manually. (${initialErr.message})`);
+            let lastErr;
+
+            // Proxy Fallback Chain: Direct -> AllOrigins -> CORS.lol -> corsproxy.io
+            const attemptLoad = async () => {
+                // 1. Try Direct (or Vite Bridge)
+                try {
+                    return await fetchPDF(fetchUrl, null);
+                } catch (err) {
+                    console.warn("Direct load failed:", err.message);
+                    lastErr = err;
+
+                    // Only fallback on NETWORK_ERROR (CORS, DNS, connection reset)
+                    if (err.type === 'HTTP_ERROR') {
+                        console.warn(`Bridge/Server reported status ${err.status}. CORS was not the blocker, so proxies were skipped.`);
+                        throw err;
                     }
-                } else {
-                    throw initialErr;
+
+                    if (!isRemoteCandidate) {
+                        throw new Error(`Local file load failed: ${err.message}`);
+                    }
+
+                    if (!allowRemote) {
+                        throw new Error("Remote load blocked by secondary failsafe (policy disabled).");
+                    }
                 }
+
+                // If it's a remote URL, try fallbacks
+                if (isRemoteCandidate) {
+                    const getProxyUrl = (target, type) => {
+                        if (type === 'allorigins') return `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`;
+                        if (type === 'cors.lol') return `https://cors.lol/${target}`;
+                        if (type === 'corsproxy.io') return `https://corsproxy.io/?url=${encodeURIComponent(target)}`;
+                        return target;
+                    };
+
+                    // 2. AllOrigins
+                    try {
+                        return await fetchPDF(getProxyUrl(url, 'allorigins'), 'allorigins');
+                    } catch (err) {
+                        console.warn("AllOrigins failed:", err.message);
+                        lastErr = err;
+                    }
+
+                    // 3. CORS.lol
+                    try {
+                        return await fetchPDF(getProxyUrl(url, 'cors.lol'), 'cors.lol');
+                    } catch (err) {
+                        console.warn("CORS.lol failed:", err.message);
+                        lastErr = err;
+                    }
+
+                    // 4. corsproxy.io
+                    try {
+                        return await fetchPDF(getProxyUrl(url, 'corsproxy.io'), 'corsproxy.io');
+                    } catch (err) {
+                        console.warn("corsproxy.io failed:", err.message);
+                        lastErr = err;
+                    }
+
+                    throw new Error(`Failed to load remote PDF after multiple proxy attempts: ${lastErr?.message || 'Unknown error'}`);
+                }
+
+                throw lastErr || new Error("Unknown loading error.");
+            };
+
+            arrayBuffer = await attemptLoad();
+            const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
+
+            let sourceUrl = null;
+            if (/^https?:\/\//i.test(url)) {
+                sourceUrl = url;
+            } else if (typeof __REVEAL_ABSOLUTE_PATH__ !== 'undefined' && __REVEAL_ABSOLUTE_PATH__) {
+                // Reconstruct absolute path for local files if allowed
+                // __PDF_SAMPLES_ROOT__ is injected by Vite define
+                const normalizedRoot = __PDF_SAMPLES_ROOT__.replace(/\\/g, '/');
+                sourceUrl = `file:///${normalizedRoot}/${url}`;
             }
-            const pdfDoc = await window.pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
 
             const pdfData = {
                 doc: pdfDoc,
-                name: url.split(/[\\/]/).pop(),
+                name: url.split(/[\\/]/).pop().split('?')[0] || 'Remote PDF',
                 numPages: pdfDoc.numPages,
-                data: arrayBuffer
+                data: arrayBuffer,
+                sourceUrl: sourceUrl // Store formatted URL for "Open outside"
             };
 
             if (side === 'left') {
@@ -126,26 +272,20 @@ export default function SideBySidePDF() {
         } finally {
             setIsUrlLoading(prev => ({ ...prev, [side]: false }));
         }
-    }, [pdfjsLoaded]);
+    }, []);
 
-    // Parse URL on mount
     useEffect(() => {
-        if (!pdfjsLoaded) return;
-
         const params = new URLSearchParams(window.location.search);
-        const leftUrl = params.get('left');
-        const rightUrl = params.get('right');
-
+        const leftUrl = params.get('a');
+        const rightUrl = params.get('b');
         if (leftUrl) loadPDFFromURL(leftUrl, 'left');
         if (rightUrl) loadPDFFromURL(rightUrl, 'right');
-    }, [pdfjsLoaded, loadPDFFromURL]);
+    }, [loadPDFFromURL]);
 
-    // Save author name to localStorage
     useEffect(() => {
         localStorage.setItem('pdf_author_name', authorName);
     }, [authorName]);
 
-    // Session Persistence: Load on mount
     useEffect(() => {
         const savedComments = localStorage.getItem('pdf_comments_backup');
         if (savedComments) {
@@ -166,7 +306,6 @@ export default function SideBySidePDF() {
         }
     }, []);
 
-    // Session Persistence: Save on change
     useEffect(() => {
         if (Object.keys(comments).length > 0) {
             localStorage.setItem('pdf_comments_backup', JSON.stringify(comments));
@@ -175,7 +314,6 @@ export default function SideBySidePDF() {
         }
     }, [comments]);
 
-    // Exit protection
     useEffect(() => {
         const handleBeforeUnload = (e) => {
             if (isDirty) {
@@ -188,55 +326,7 @@ export default function SideBySidePDF() {
         return () => window.removeEventListener('beforeunload', handleBeforeUnload);
     }, [isDirty]);
 
-    const leftContainerRef = useRef(null);
-    const rightContainerRef = useRef(null);
-    const leftViewerRef = useRef(null);
-    const rightViewerRef = useRef(null);
-
-    const isSyncingLeft = useRef(false);
-    const isSyncingRight = useRef(false);
-
-    const leftRenderTask = useRef(null);
-    const rightRenderTask = useRef(null);
-    const leftPreRenderTask = useRef(null);
-    const rightPreRenderTask = useRef(null);
-
-    const leftPreRenderCache = useRef({ page: null, scale: null, content: null });
-    const rightPreRenderCache = useRef({ page: null, scale: null, content: null });
-
     useEffect(() => {
-        if (window.pdfjsLib) {
-            setPdfjsLoaded(true);
-            return;
-        }
-
-        // Use legacy build which includes proper font handling
-        const script = document.createElement('script');
-        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
-        script.async = true;
-        script.onload = () => {
-            window.pdfjsLib.GlobalWorkerOptions.workerSrc =
-                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-
-            // Enable standard font data for better text rendering
-            window.pdfjsLib.GlobalWorkerOptions.standardFontDataUrl =
-                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/standard_fonts/';
-
-            setPdfjsLoaded(true);
-        };
-        script.onerror = () => {
-            console.error('Failed to load PDF.js script');
-            alert('Failed to load PDF engine. Please check your internet connection.');
-        };
-        document.head.appendChild(script);
-
-        // Load official pdf.js text layer CSS
-        const link = document.createElement('link');
-        link.rel = 'stylesheet';
-        link.href = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.css';
-        document.head.appendChild(link);
-
-        // Add minimal overrides for our use case
         const style = document.createElement('style');
         style.textContent = `
       .textLayer {
@@ -246,7 +336,7 @@ export default function SideBySidePDF() {
         pointer-events: auto;
       }
       .textLayer ::selection {
-        background: rgba(0, 100, 255, 0.3);
+        background: rgba(0, 100, 255, 0.5);
       }
       .pdf-page-canvas {
         display: block;
@@ -255,183 +345,87 @@ export default function SideBySidePDF() {
         document.head.appendChild(style);
 
         return () => {
-            if (document.head.contains(link)) {
-                document.head.removeChild(link);
-            }
-            if (document.head.contains(style)) {
-                document.head.removeChild(style);
-            }
+            if (document.head.contains(style)) document.head.removeChild(style);
         };
     }, []);
 
-    const renderPDFPage = async (pdfDoc, pageNum, container, scale, renderTaskRef, isPreRender = false, cacheRef = null) => {
-        if (!pdfDoc || (!isPreRender && !container) || !window.pdfjsLib) return;
-
-        // If this is a real render and we have a cached version, swap it immediately
-        if (!isPreRender && cacheRef && cacheRef.current.page === pageNum && cacheRef.current.scale === scale && cacheRef.current.content) {
-            container.replaceChildren(...cacheRef.current.content.childNodes);
-            // Clear cache after use to prevent stale content
-            cacheRef.current = { page: null, scale: null, content: null };
-            return;
-        }
-
-        if (renderTaskRef.current) {
-            try {
-                await renderTaskRef.current.cancel();
-            } catch {
-                // Cancellation is expected
-            }
-        }
-
-        try {
-            // Create a temporary container for rendering to avoid flashes
-            const tempDiv = document.createElement('div');
-            tempDiv.style.position = 'relative';
-
-            const page = await pdfDoc.getPage(pageNum);
-            const viewport = page.getViewport({ scale });
-            const outputScale = window.devicePixelRatio || 1;
-
-            const canvas = document.createElement('canvas');
-            canvas.className = 'pdf-page-canvas';
-            const context = canvas.getContext('2d');
-
-            canvas.width = Math.floor(viewport.width * outputScale);
-            canvas.height = Math.floor(viewport.height * outputScale);
-            canvas.style.width = Math.floor(viewport.width) + 'px';
-            canvas.style.height = Math.floor(viewport.height) + 'px';
-
-            const transform = outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
-
-            renderTaskRef.current = page.render({
-                canvasContext: context,
-                viewport: viewport,
-                transform: transform
-            });
-
-            await renderTaskRef.current.promise;
-            renderTaskRef.current = null;
-
-            tempDiv.appendChild(canvas);
-
-            const textLayerDiv = document.createElement('div');
-            textLayerDiv.className = 'textLayer';
-            textLayerDiv.style.width = Math.floor(viewport.width) + 'px';
-            textLayerDiv.style.height = Math.floor(viewport.height) + 'px';
-            textLayerDiv.style.setProperty('--scale-factor', scale.toString());
-            tempDiv.appendChild(textLayerDiv);
-
-            const textContent = await page.getTextContent();
-
-            if (window.pdfjsLib.TextLayer) {
-                const textLayer = new window.pdfjsLib.TextLayer({
-                    textContentSource: textContent,
-                    container: textLayerDiv,
-                    viewport: viewport,
-                });
-                await textLayer.render();
+    const handleToggleSync = () => {
+        if (!syncScroll) {
+            // Turning ON
+            // Calculate current offset
+            if (viewMode === 'continuous' && leftComponentRef.current && rightComponentRef.current) {
+                const leftGSP = leftComponentRef.current.getGlobalScrollPosition();
+                const rightGSP = rightComponentRef.current.getGlobalScrollPosition();
+                setSyncOffset(rightGSP - leftGSP);
             } else {
-                const renderTask = window.pdfjsLib.renderTextLayer({
-                    textContent: textContent,
-                    container: textLayerDiv,
-                    viewport: viewport,
-                    textDivs: []
-                });
-                if (renderTask.promise) await renderTask.promise;
+                setSyncOffset(0);
             }
-
-            // Swap: Replace the entire content once ready
-            if (isPreRender && cacheRef) {
-                // For pre-render, just store it
-                cacheRef.current = { page: pageNum, scale: scale, content: tempDiv };
-            } else {
-                container.replaceChildren(...tempDiv.childNodes);
-            }
-        } catch (error) {
-            if (error.name !== 'RenderingCancelledException') {
-                console.error('Error rendering page:', error);
-            }
+            setSyncScroll(true);
+        } else {
+            // Turning OFF
+            setSyncScroll(false);
         }
     };
 
-    useEffect(() => {
-        if (leftPDF && leftContainerRef.current && pdfjsLoaded) {
-            renderPDFPage(leftPDF.doc, leftPage, leftContainerRef.current, leftScale, leftRenderTask, false, leftPreRenderCache).then(() => {
-                // After successful render, pre-render the next page
-                if (leftPage < leftPDF.numPages) {
-                    renderPDFPage(leftPDF.doc, leftPage + 1, null, leftScale, leftPreRenderTask, true, leftPreRenderCache);
-                }
-            });
+    const handleScaleChange = (newScale, source, shouldSync = true) => {
+        if (source === 'left') {
+            setLeftScale(newScale);
+            if (syncScroll && shouldSync) setRightScale(newScale);
+        } else {
+            setRightScale(newScale);
+            if (syncScroll && shouldSync) setLeftScale(newScale);
         }
-    }, [leftPDF, leftPage, leftScale, pdfjsLoaded]);
+    };
 
-    useEffect(() => {
-        if (rightPDF && rightContainerRef.current && pdfjsLoaded) {
-            renderPDFPage(rightPDF.doc, rightPage, rightContainerRef.current, rightScale, rightRenderTask, false, rightPreRenderCache).then(() => {
-                // After successful render, pre-render the next page
-                if (rightPage < rightPDF.numPages) {
-                    renderPDFPage(rightPDF.doc, rightPage + 1, null, rightScale, rightPreRenderTask, true, rightPreRenderCache);
-                }
-            });
+    const handleFitToPageSync = (sourceSide) => {
+        if (!syncScroll) return;
+        const targetComponent = sourceSide === 'left' ? rightComponentRef : leftComponentRef;
+        if (targetComponent.current) {
+            targetComponent.current.triggerFitToPage();
         }
-    }, [rightPDF, rightPage, rightScale, pdfjsLoaded]);
+    };
 
     const handleFileUpload = async (e, side) => {
         const file = e.target.files[0];
         if (!file) return;
         setIsUrlLoading(prev => ({ ...prev, [side]: true }));
 
-        if (!pdfjsLoaded || !window.pdfjsLib) {
+        if (!pdfjsLib) {
             console.error('PDF.js lib not loaded');
-            alert('PDF engine is not ready yet. Please wait a moment.');
+            alert('PDF engine is not ready. Please refresh the page.');
             setIsUrlLoading(prev => ({ ...prev, [side]: false }));
             return;
         }
 
-        if (file.type !== 'application/pdf') {
-            console.warn('File type is not application/pdf:', file.type);
-            // Proceed cautiously
-        }
-
         try {
             const arrayBuffer = await file.arrayBuffer();
-            // We need to keep the buffer for export. 
-            // pdfjsLib.getDocument might transfer the buffer if it was a worker, but we are in main thread or using workerSrc.
-            // Let's copy it or pass it. 
-            const pdfDoc = await window.pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
+            const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
 
             const pdfData = {
                 doc: pdfDoc,
                 name: file.name,
                 numPages: pdfDoc.numPages,
-                data: arrayBuffer // Store raw data for export
+                data: arrayBuffer,
+                sourceUrl: URL.createObjectURL(file)
             };
 
-            // Extract existing annotations using pdf-lib for reliability
             const extractedComments = {};
             try {
                 const pdfLibDoc = await PDFDocument.load(arrayBuffer);
                 const pages = pdfLibDoc.getPages();
 
-                // Helper to safely extract text from a PDF object
                 const getText = (obj) => {
                     if (!obj) return null;
                     try {
-                        if (typeof obj.decodeText === 'function') {
-                            return obj.decodeText();
-                        }
-                        if (typeof obj.asString === 'function') {
-                            return obj.asString();
-                        }
+                        if (typeof obj.decodeText === 'function') return obj.decodeText();
+                        if (typeof obj.asString === 'function') return obj.asString();
                         const str = obj.toString();
-                        // PDF strings/names often start with / or are wrapped in ()
                         return str.replace(/^\/|^\(|\)$/g, '');
                     } catch {
                         return null;
                     }
                 };
 
-                // Helper to parse PDF date strings (D:YYYYMMDDHHmmSSOHH'mm')
                 const parsePDFDate = (dateStr) => {
                     if (!dateStr || typeof dateStr !== 'string') return new Date().toISOString();
                     const cleanDate = dateStr.replace(/^D:/, '');
@@ -538,103 +532,218 @@ export default function SideBySidePDF() {
         }
     };
 
-    const handleScroll = (e, source) => {
+    const handleScroll = (e, source, scrollInfo = null) => {
         if (!syncScroll) return;
 
-        const targetRef = source === 'left' ? rightViewerRef : leftViewerRef;
-        const scrollPercentage = e.target.scrollTop / (e.target.scrollHeight - e.target.clientHeight || 1);
-        const scrollLeftPercentage = e.target.scrollLeft / (e.target.scrollWidth - e.target.clientWidth || 1);
+        // Store the latest scroll data for RAF processing
+        pendingSyncRef.current = {
+            scrollTop: e.target.scrollTop,
+            scrollHeight: e.target.scrollHeight,
+            clientHeight: e.target.clientHeight,
+            scrollLeft: e.target.scrollLeft,
+            scrollWidth: e.target.scrollWidth,
+            clientWidth: e.target.clientWidth,
+            source,
+            scrollInfo
+        };
 
-        if (source === 'left') {
-            if (isSyncingLeft.current) {
-                isSyncingLeft.current = false;
-                return;
-            }
-            isSyncingRight.current = true;
-            if (targetRef.current) {
-                const targetMaxScroll = targetRef.current.scrollHeight - targetRef.current.clientHeight;
-                targetRef.current.scrollTop = scrollPercentage * targetMaxScroll;
+        // Skip if RAF already scheduled
+        if (syncRAFRef.current) return;
 
-                const targetMaxScrollLeft = targetRef.current.scrollWidth - targetRef.current.clientWidth;
-                targetRef.current.scrollLeft = scrollLeftPercentage * targetMaxScrollLeft;
-            }
-        } else {
-            if (isSyncingRight.current) {
-                isSyncingRight.current = false;
-                return;
-            }
-            isSyncingLeft.current = true;
-            if (targetRef.current) {
-                const targetMaxScroll = targetRef.current.scrollHeight - targetRef.current.clientHeight;
-                targetRef.current.scrollTop = scrollPercentage * targetMaxScroll;
+        syncRAFRef.current = requestAnimationFrame(() => {
+            syncRAFRef.current = null;
+            const data = pendingSyncRef.current;
+            if (!data) return;
 
-                const targetMaxScrollLeft = targetRef.current.scrollWidth - targetRef.current.clientWidth;
-                targetRef.current.scrollLeft = scrollLeftPercentage * targetMaxScrollLeft;
+            const { source, scrollInfo } = data;
+            const targetViewer = source === 'left' ? rightViewerRef : leftViewerRef;
+            const targetComponent = source === 'left' ? rightComponentRef : leftComponentRef;
+
+            // Prevent infinite loop
+            const setSyncLock = (side) => {
+                if (side === 'left') {
+                    isSyncingLeft.current = true;
+                    // Safety timeout
+                    if (leftSyncTimeoutRef.current) clearTimeout(leftSyncTimeoutRef.current);
+                    leftSyncTimeoutRef.current = setTimeout(() => isSyncingLeft.current = false, 100);
+                } else {
+                    isSyncingRight.current = true;
+                    // Safety timeout
+                    if (rightSyncTimeoutRef.current) clearTimeout(rightSyncTimeoutRef.current);
+                    rightSyncTimeoutRef.current = setTimeout(() => isSyncingRight.current = false, 100);
+                }
+            };
+
+            if (source === 'left') {
+                if (isSyncingLeft.current) {
+                    isSyncingLeft.current = false; // Acknowledge receipt
+                    return;
+                }
+            } else {
+                if (isSyncingRight.current) {
+                    isSyncingRight.current = false; // Acknowledge receipt
+                    return;
+                }
             }
-        }
+
+            // Page-Relative Sync Logic for Continuous Mode (Restored)
+            if (viewMode === 'continuous' && scrollInfo && targetComponent.current) {
+                const sourceGSP = (scrollInfo.page - 1) + scrollInfo.percent;
+                let targetGSP;
+                if (source === 'left') {
+                    targetGSP = sourceGSP + syncOffset;
+                } else {
+                    targetGSP = sourceGSP - syncOffset;
+                }
+
+                const targetNumPages = source === 'left' ? rightPDF?.numPages : leftPDF?.numPages;
+                if (targetNumPages) {
+                    targetGSP = Math.max(0, Math.min(targetGSP, targetNumPages));
+                }
+
+                // Variance Check: Is target already close enough?
+                const currentTargetGSP = targetComponent.current.getGlobalScrollPosition();
+                const verticalDiff = Math.abs(currentTargetGSP - targetGSP);
+
+                // Horizontal Calculation
+                const hasHorizontalScroll = data.scrollWidth > data.clientWidth;
+                let horizontalPercent = 0;
+                if (hasHorizontalScroll) {
+                    horizontalPercent = data.scrollLeft / (data.scrollWidth - data.clientWidth);
+                }
+
+                let horizontalSynced = true;
+                if (targetViewer.current) {
+                    const tMax = targetViewer.current.scrollWidth - targetViewer.current.clientWidth;
+                    if (tMax > 0) {
+                        const tCurrent = targetViewer.current.scrollLeft;
+                        const tExpected = tMax * horizontalPercent;
+                        if (Math.abs(tCurrent - tExpected) > 5) horizontalSynced = false;
+                    }
+                }
+
+                // Only skip if BOTH are synced
+                if (verticalDiff < 0.005 && horizontalSynced) return;
+
+                // Lock Target
+                setSyncLock(source === 'left' ? 'right' : 'left');
+
+                const targetPage = Math.floor(targetGSP) + 1;
+                const targetPercent = targetGSP % 1;
+
+                targetComponent.current.scrollToPagePercent(targetPage, targetPercent, horizontalPercent);
+            }
+            else if (targetViewer.current) {
+                setSyncLock(source === 'left' ? 'right' : 'left');
+
+                const scrollPercentage = data.scrollTop / (data.scrollHeight - data.clientHeight || 1);
+                const targetMaxScroll = targetViewer.current.scrollHeight - targetViewer.current.clientHeight;
+                targetViewer.current.scrollTop = scrollPercentage * targetMaxScroll;
+
+                const scrollLeftPercentage = data.scrollLeft / (data.scrollWidth - data.clientWidth || 1);
+                const targetMaxScrollLeft = targetViewer.current.scrollWidth - targetViewer.current.clientWidth;
+                targetViewer.current.scrollLeft = scrollLeftPercentage * targetMaxScrollLeft;
+            }
+        });
     };
+
+    // Cleanup Timeouts
+    useEffect(() => {
+        return () => {
+            if (leftSyncTimeoutRef.current) clearTimeout(leftSyncTimeoutRef.current);
+            if (rightSyncTimeoutRef.current) clearTimeout(rightSyncTimeoutRef.current);
+        };
+    }, []);
 
     const handlePageChange = (newPage, side) => {
         const oldPage = side === 'left' ? leftPage : rightPage;
-        if (newPage === oldPage) return;
         const delta = newPage - oldPage;
 
         if (side === 'left') {
             setLeftPage(newPage);
-            if (syncScroll && rightPDF) {
+            // Scroll sync handles alignment in continuous mode
+            if (syncScroll && rightPDF && viewMode !== 'continuous') {
                 setRightPage(prev => Math.min(Math.max(1, prev + delta), rightPDF.numPages));
             }
         } else {
             setRightPage(newPage);
-            if (syncScroll && leftPDF) {
+            if (syncScroll && leftPDF && viewMode !== 'continuous') {
                 setLeftPage(prev => Math.min(Math.max(1, prev + delta), leftPDF.numPages));
             }
         }
     };
 
-    const handleScaleChange = (newScale, side) => {
-        if (syncScroll) {
-            setLeftScale(newScale);
-            setRightScale(newScale);
-        } else {
-            if (side === 'left') {
-                setLeftScale(newScale);
-            } else {
-                setRightScale(newScale);
-            }
-        }
-    };
-
-    const addComment = (side, x, y, highlightRect = null, selectedText = '') => {
+    const addComment = (side, x, y, highlightRects = null, selectedText = '', pageNum = null) => {
         const id = `${side}-${Date.now()}`;
-        setActiveComment({
+        // Use the explicitly passed page number, or fall back to current page state
+        const targetPage = pageNum ?? (side === 'left' ? leftPage : rightPage);
+        const newComment = {
             id,
             side,
             x,
             y,
             text: '',
-            highlightRect,
-            selectedText
-        });
-        setCommentText('');
-        setIsDirty(true); // Manually mark as dirty
+            highlightRects,
+            selectedText,
+            page: targetPage
+        };
+
+        if (side === 'left') {
+            setLeftActiveComment(newComment);
+            setLeftCommentText('');
+        } else {
+            setRightActiveComment(newComment);
+            setRightCommentText('');
+        }
+        setIsDirty(true);
     };
 
-    const saveComment = () => {
-        if (activeComment && commentText.trim()) {
+    const addHighlight = (side, x, y, highlightRects, selectedText, pageNum = null) => {
+        const id = `${side}-highlight-${Date.now()}`;
+        // Use the explicitly passed page number, or fall back to current page state
+        const targetPage = pageNum ?? (side === 'left' ? leftPage : rightPage);
+        setComments(prev => ({
+            ...prev,
+            [id]: {
+                id,
+                side,
+                x,
+                y,
+                text: '', // Empty text for pure highlight
+                highlightRects,
+                selectedText,
+                page: targetPage,
+                timestamp: new Date().toISOString(),
+                author: authorName
+            }
+        }));
+        setIsDirty(true);
+    };
+
+    const saveComment = (side) => {
+        const active = side === 'left' ? leftActiveComment : rightActiveComment;
+        const text = side === 'left' ? leftCommentText : rightCommentText;
+
+        if (active && text.trim()) {
             setComments(prev => ({
                 ...prev,
-                [activeComment.id]: {
-                    ...activeComment,
-                    text: commentText,
+                [active.id]: {
+                    ...active,
+                    text: text,
                     author: authorName,
-                    page: activeComment.side === 'left' ? leftPage : rightPage,
+                    page: active.page || (side === 'left' ? leftPage : rightPage),
                     timestamp: new Date().toISOString()
                 }
             }));
-            setActiveComment(null);
-            setCommentText('');
-            setIsDirty(true); // Manually mark as dirty
+
+            if (side === 'left') {
+                setLeftActiveComment(null);
+                setLeftCommentText('');
+            } else {
+                setRightActiveComment(null);
+                setRightCommentText('');
+            }
+            setIsDirty(true);
         }
     };
 
@@ -642,9 +751,10 @@ export default function SideBySidePDF() {
         setComments(prev => {
             const newComments = { ...prev };
             delete newComments[id];
+            // Set isDirty based on whether there are still comments remaining
+            setIsDirty(Object.keys(newComments).length > 0);
             return newComments;
         });
-        setIsDirty(true); // Manually mark as dirty
     };
 
     const processPDFAndDownload = async (side) => {
@@ -659,7 +769,6 @@ export default function SideBySidePDF() {
 
         try {
             const pdfDoc = await PDFDocument.load(pdfData.data);
-            const { PDFName, PDFString, PDFArray } = await import('pdf-lib');
 
             for (const comment of sideComments) {
                 const pageIndex = comment.page - 1;
@@ -668,7 +777,6 @@ export default function SideBySidePDF() {
                 const page = pdfDoc.getPage(pageIndex);
                 const { width, height } = page.getSize();
 
-                // Convert % to points
                 const x = (comment.x / 100) * width;
                 const y = height - ((comment.y / 100) * height);
 
@@ -688,27 +796,32 @@ export default function SideBySidePDF() {
                 };
 
                 const commentDate = comment.timestamp ? new Date(comment.timestamp) : new Date();
-                const highlightColor = [1, 1, 0]; // Yellow
+                const highlightColor = [1, 1, 0];
                 const annotId = `annot-${comment.id}-${Date.now()}`;
 
                 let annot;
                 let annotRect;
 
-                if (comment.highlightRect) {
-                    const hr = comment.highlightRect;
-                    const left = (hr.left / 100) * width;
-                    const right = (hr.right / 100) * width;
-                    const top = height - ((hr.top / 100) * height);
-                    const bottom = height - ((hr.bottom / 100) * height);
+                if (comment.highlightRects || comment.highlightRect) {
+                    const rects = comment.highlightRects || [comment.highlightRect];
+                    const quadPoints = [];
+                    let minL = Infinity, minB = Infinity, maxR = -Infinity, maxT = -Infinity;
 
-                    const quadPoints = [
-                        left, top,      // top-left
-                        right, top,     // top-right
-                        left, bottom,   // bottom-left
-                        right, bottom   // bottom-right
-                    ];
+                    for (const hr of rects) {
+                        const left = (hr.left / 100) * width;
+                        const right = (hr.right / 100) * width;
+                        const top = height - ((hr.top / 100) * height);
+                        const bottom = height - ((hr.bottom / 100) * height);
 
-                    annotRect = [left, bottom, right, top];
+                        quadPoints.push(left, top, right, top, left, bottom, right, bottom);
+
+                        minL = Math.min(minL, left);
+                        minB = Math.min(minB, bottom);
+                        maxR = Math.max(maxR, right);
+                        maxT = Math.max(maxT, top);
+                    }
+
+                    annotRect = [minL, minB, maxR, maxT];
 
                     annot = pdfDoc.context.obj({
                         Type: PDFName.of('Annot'),
@@ -716,11 +829,11 @@ export default function SideBySidePDF() {
                         NM: PDFString.of(annotId),
                         Rect: annotRect,
                         QuadPoints: quadPoints,
-                        Contents: PDFString.of(comment.text),
+                        Contents: PDFString.of(comment.text || ''),
                         C: highlightColor,
                         CA: 0.4,
                         F: 4,
-                        T: PDFString.of('Author'),
+                        T: PDFString.of(comment.author || 'Author'),
                         M: PDFString.of(formatPDFDate(commentDate)),
                         CreationDate: PDFString.of(formatPDFDate(commentDate)),
                     });
@@ -732,12 +845,12 @@ export default function SideBySidePDF() {
                         Subtype: PDFName.of('Text'),
                         NM: PDFString.of(annotId),
                         Rect: annotRect,
-                        Contents: PDFString.of(comment.text),
+                        Contents: PDFString.of(comment.text || ''),
                         C: highlightColor,
                         Name: PDFName.of('Comment'),
                         Open: false,
                         F: 4,
-                        T: PDFString.of('Author'),
+                        T: PDFString.of(comment.author || 'Author'),
                         M: PDFString.of(formatPDFDate(commentDate)),
                         CreationDate: PDFString.of(formatPDFDate(commentDate)),
                     });
@@ -745,33 +858,44 @@ export default function SideBySidePDF() {
 
                 const annotRef = pdfDoc.context.register(annot);
 
-                // Create linked Popup annotation for sidebar visibility
-                const popupRect = [
-                    annotRect[2],
-                    annotRect[1],
-                    annotRect[2] + 200,
-                    annotRect[1] + 100
-                ];
+                // Only add popup if there is text content
+                if (comment.text && comment.text.trim()) {
+                    const popupRect = [
+                        annotRect[2],
+                        annotRect[1],
+                        annotRect[2] + 200,
+                        annotRect[1] + 100
+                    ];
 
-                const popup = pdfDoc.context.obj({
-                    Type: PDFName.of('Annot'),
-                    Subtype: PDFName.of('Popup'),
-                    Rect: popupRect,
-                    Parent: annotRef,
-                    Open: false,
-                    F: 0,
-                });
+                    const popup = pdfDoc.context.obj({
+                        Type: PDFName.of('Annot'),
+                        Subtype: PDFName.of('Popup'),
+                        Rect: popupRect,
+                        Parent: annotRef,
+                        Open: false,
+                        F: 0,
+                    });
 
-                const popupRef = pdfDoc.context.register(popup);
-                annot.set(PDFName.of('Popup'), popupRef);
+                    const popupRef = pdfDoc.context.register(popup);
+                    annot.set(PDFName.of('Popup'), popupRef);
 
-                const existingAnnots = page.node.lookup(PDFName.of('Annots'));
-                if (existingAnnots instanceof PDFArray) {
-                    existingAnnots.push(annotRef);
-                    existingAnnots.push(popupRef);
+                    const existingAnnots = page.node.lookup(PDFName.of('Annots'));
+                    if (existingAnnots instanceof PDFArray) {
+                        existingAnnots.push(annotRef);
+                        existingAnnots.push(popupRef);
+                    } else {
+                        const newAnnots = pdfDoc.context.obj([annotRef, popupRef]);
+                        page.node.set(PDFName.of('Annots'), newAnnots);
+                    }
                 } else {
-                    const newAnnots = pdfDoc.context.obj([annotRef, popupRef]);
-                    page.node.set(PDFName.of('Annots'), newAnnots);
+                    // Just add the annotation
+                    const existingAnnots = page.node.lookup(PDFName.of('Annots'));
+                    if (existingAnnots instanceof PDFArray) {
+                        existingAnnots.push(annotRef);
+                    } else {
+                        const newAnnots = pdfDoc.context.obj([annotRef]);
+                        page.node.set(PDFName.of('Annots'), newAnnots);
+                    }
                 }
             }
 
@@ -788,7 +912,6 @@ export default function SideBySidePDF() {
             a.click();
             URL.revokeObjectURL(url);
 
-            // Clear dirty flag and backup on successful export
             setIsDirty(false);
             localStorage.removeItem('pdf_comments_backup');
         } catch (err) {
@@ -797,182 +920,98 @@ export default function SideBySidePDF() {
         }
     };
 
-    const exportSinglePDF = async (side) => {
-        await processPDFAndDownload(side);
-    };
-
-    const forceClosePDF = (side) => {
-        if (side === 'left') {
-            setLeftPDF(null);
-            setLeftPage(1);
-            setLeftScale(1.0);
-        } else {
-            setRightPDF(null);
-            setRightPage(1);
-            setRightScale(1.0);
-        }
-
-        // Remove comments for this side
-        setComments(prev => {
-            const next = { ...prev };
-            Object.keys(next).forEach(key => {
-                if (next[key].side === side) delete next[key];
-            });
-            return next;
-        });
-
-        // Update URL and clear dirty if needed
-        updateUrlParams(side, null);
-        setCloseConfirmSide(null);
-
-        // Check if any comments remain for the OTHER side
-        const otherSide = side === 'left' ? 'right' : 'left';
-        const hasOtherComments = Object.values(comments).some(c => c.side === otherSide);
-        if (!hasOtherComments) setIsDirty(false);
-    };
-
-    const handleCloseRequest = (side) => {
-        const hasSideComments = Object.values(comments).some(c => c.side === side);
-        if (hasSideComments) {
-            setCloseConfirmSide(side);
-        } else {
-            forceClosePDF(side);
-        }
-    };
-
     return (
-        <div className="w-full h-screen flex flex-col bg-gray-100 p-2">
-            <div className="flex-1 flex gap-2 min-h-0">
-                <PDFViewer
-                    pdf={leftPDF}
-                    side="left"
-                    page={leftPage}
-                    setPage={(p) => handlePageChange(p, 'left')}
-                    scale={leftScale}
-                    setScale={(s) => handleScaleChange(s, 'left')}
-                    containerRef={leftContainerRef}
-                    viewerRef={leftViewerRef}
-                    onScroll={handleScroll}
-                    onUpload={(e) => handleFileUpload(e, 'left')}
-                    onExport={() => exportSinglePDF('left')}
-                    comments={comments}
-                    deleteComment={deleteComment}
-                    activeComment={activeComment}
-                    setActiveComment={setActiveComment}
-                    commentText={commentText}
-                    setCommentText={setCommentText}
-                    saveComment={saveComment}
-                    addComment={addComment}
-                    pdfjsLoaded={pdfjsLoaded}
-                    syncScroll={syncScroll}
-                    setSyncScroll={setSyncScroll}
-                    hasComments={Object.values(comments).some(c => c.side === 'left')}
-                    isDirty={isDirty}
-                    authorName={authorName}
-                    setAuthorName={setAuthorName}
-                    onClose={() => handleCloseRequest('left')}
-                    onLoadFromUrl={(url) => loadPDFFromURL(url, 'left')}
-                    isLoading={isUrlLoading.left}
-                />
-                <PDFViewer
-                    pdf={rightPDF}
-                    side="right"
-                    page={rightPage}
-                    setPage={(p) => handlePageChange(p, 'right')}
-                    scale={rightScale}
-                    setScale={(s) => handleScaleChange(s, 'right')}
-                    containerRef={rightContainerRef}
-                    viewerRef={rightViewerRef}
-                    onScroll={handleScroll}
-                    onUpload={(e) => handleFileUpload(e, 'right')}
-                    onExport={() => exportSinglePDF('right')}
-                    comments={comments}
-                    deleteComment={deleteComment}
-                    activeComment={activeComment}
-                    setActiveComment={setActiveComment}
-                    commentText={commentText}
-                    setCommentText={setCommentText}
-                    saveComment={saveComment}
-                    addComment={addComment}
-                    pdfjsLoaded={pdfjsLoaded}
-                    hasComments={Object.values(comments).some(c => c.side === 'right')}
-                    isDirty={isDirty}
-                    authorName={authorName}
-                    setAuthorName={setAuthorName}
-                    onClose={() => handleCloseRequest('right')}
-                    onLoadFromUrl={(url) => loadPDFFromURL(url, 'right')}
-                    isLoading={isUrlLoading.right}
-                />
-            </div>
+        <div className="flex flex-col h-screen bg-gray-50 overflow-hidden">
 
-            {/* Error Modal */}
+
             {loadingError && (
-                <div className="fixed inset-0 bg-black/40 backdrop-blur-[2px] z-[200] flex items-center justify-center p-4 animate-in fade-in duration-300">
-                    <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6 border border-red-100 transform animate-in slide-in-from-bottom-4 duration-300">
-                        <div className="flex items-center gap-3 text-red-600 mb-4">
-                            <div className="p-2 bg-red-50 rounded-lg">
-                                <AlertCircle className="w-6 h-6" />
-                            </div>
-                            <h2 className="text-lg font-bold">Failed to Load PDF</h2>
+                <div className="fixed top-4 left-1/2 transform -translate-x-1/2 z-50 animate-in slide-in-from-top fade-in duration-300 w-full max-w-2xl px-4">
+                    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-none shadow-lg flex items-start gap-3">
+                        <AlertTriangle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                        <div className="flex-1 min-w-0">
+                            <p className="font-semibold text-sm">Error Loading PDF</p>
+                            <p className="text-sm mt-1 opacity-90 whitespace-normal break-words leading-relaxed">{loadingError.message}</p>
+                            <p className="text-xs mt-2 font-mono bg-red-100 px-2 py-1 rounded-none break-words whitespace-normal">{loadingError.url}</p>
                         </div>
-
-                        <div className="space-y-3 mb-6">
-                            <div className="text-[10px] text-gray-400 font-bold uppercase tracking-wider">Error Details</div>
-                            <div className="bg-gray-50 rounded-lg p-3 border border-gray-100">
-                                <p className="text-sm font-medium text-gray-700 break-words mb-1">
-                                    <span className="text-gray-400 mr-2">Target:</span> {loadingError.url}
-                                </p>
-                                <p className="text-xs text-red-500 font-mono italic leading-relaxed">
-                                    {loadingError.message}
-                                </p>
-                            </div>
-                        </div>
-
-                        <button
-                            onClick={() => setLoadingError(null)}
-                            className="w-full bg-gray-900 text-white rounded-lg py-2.5 font-medium hover:bg-gray-800 transition-colors shadow-lg shadow-gray-200"
-                        >
-                            Dismiss
+                        <button onClick={() => setLoadingError(null)} className="ml-2 text-red-400 hover:text-red-700">
+                            <X className="w-4 h-4" />
                         </button>
                     </div>
                 </div>
             )}
 
-            {/* Close Confirmation Modal */}
-            {closeConfirmSide && (
-                <div className="fixed inset-0 bg-black/40 backdrop-blur-[2px] z-[200] flex items-center justify-center p-4 animate-in fade-in duration-300">
-                    <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6 border border-gray-100 transform animate-in slide-in-from-bottom-4 duration-300">
-                        <h2 className="text-lg font-bold text-gray-900 mb-2">Unsaved Changes</h2>
-                        <p className="text-sm text-gray-600 mb-6">
-                            You have unsaved comments on the {closeConfirmSide} PDF. Closing it will discard them.
-                        </p>
-                        <div className="flex flex-col gap-2">
-                            <button
-                                onClick={async () => {
-                                    await exportSinglePDF(closeConfirmSide);
-                                    forceClosePDF(closeConfirmSide);
-                                }}
-                                className="w-full bg-purple-600 text-white rounded-lg py-2 font-medium hover:bg-purple-700 transition-colors"
-                            >
-                                Save & Close
-                            </button>
-                            <button
-                                onClick={() => forceClosePDF(closeConfirmSide)}
-                                className="w-full bg-white border border-red-200 text-red-600 rounded-lg py-2 font-medium hover:bg-red-50 transition-colors"
-                            >
-                                Close without Saving
-                            </button>
-                            <button
-                                onClick={() => setCloseConfirmSide(null)}
-                                className="w-full bg-gray-100 text-gray-700 rounded-lg py-2 font-medium hover:bg-gray-200 transition-colors mt-2"
-                            >
-                                Cancel
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
+            <main className="flex-1 flex overflow-hidden">
+                <PDFViewer
+                    className="flex-1 border-r border-gray-300 relative"
+                    ref={leftComponentRef} // Use Component Ref
+                    viewerRef={leftViewerRef} // Legacy dom ref
+                    pdf={leftPDF}
+                    side="left"
+                    page={leftPage}
+                    setPage={(p) => handlePageChange(p, 'left')}
+                    scale={leftScale}
+                    setScale={(s, sync) => handleScaleChange(s, 'left', sync)}
+                    viewMode={viewMode}
+                    setViewMode={handleSetViewMode}
+                    onScroll={(e, _side, info) => handleScroll(e, 'left', info)}
+                    onUpload={(e) => handleFileUpload(e, 'left')}
+                    onExport={() => processPDFAndDownload('left')}
+                    comments={comments}
+                    deleteComment={deleteComment}
+                    activeComment={leftActiveComment}
+                    setActiveComment={setLeftActiveComment}
+                    commentText={leftCommentText}
+                    setCommentText={setLeftCommentText}
+                    saveComment={() => saveComment('left')}
+                    addComment={addComment}
+                    addHighlight={addHighlight}
+                    syncScroll={syncScroll}
+                    setSyncScroll={handleToggleSync}
+                    hasComments={Object.values(comments).some(c => c.side === 'left')}
+                    isDirty={isDirty}
+                    authorName={authorName}
+                    setAuthorName={setAuthorName}
+                    onClose={() => setLeftPDF(null)}
+                    onLoadFromUrl={(url) => loadPDFFromURL(url, 'left')}
+                    onFitToPage={() => handleFitToPageSync('left')}
+                    isLoading={isUrlLoading.left}
+                />
+                <PDFViewer
+                    className="flex-1 relative"
+                    ref={rightComponentRef} // Use Component Ref
+                    viewerRef={rightViewerRef} // Legacy dom ref
+                    pdf={rightPDF}
+                    side="right"
+                    page={rightPage}
+                    setPage={(p) => handlePageChange(p, 'right')}
+                    scale={rightScale}
+                    setScale={(s, sync) => handleScaleChange(s, 'right', sync)}
+                    viewMode={viewMode}
+                    setViewMode={handleSetViewMode}
+                    onScroll={(e, _side, info) => handleScroll(e, 'right', info)}
+                    onUpload={(e) => handleFileUpload(e, 'right')}
+                    onExport={() => processPDFAndDownload('right')}
+                    comments={comments}
+                    deleteComment={deleteComment}
+                    activeComment={rightActiveComment}
+                    setActiveComment={setRightActiveComment}
+                    commentText={rightCommentText}
+                    setCommentText={setRightCommentText}
+                    saveComment={() => saveComment('right')}
+                    addComment={addComment}
+                    addHighlight={addHighlight}
+                    syncScroll={syncScroll}
+                    setSyncScroll={handleToggleSync}
+                    hasComments={Object.values(comments).some(c => c.side === 'right')}
+                    isDirty={isDirty}
+                    authorName={authorName}
+                    setAuthorName={setAuthorName}
+                    onClose={() => setRightPDF(null)}
+                    onLoadFromUrl={(url) => loadPDFFromURL(url, 'right')}
+                    onFitToPage={() => handleFitToPageSync('right')}
+                    isLoading={isUrlLoading.right}
+                />
+            </main>
         </div>
     );
-
 }
