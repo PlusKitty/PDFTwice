@@ -8,6 +8,7 @@ import https from 'node:https'
 import dns from 'node:dns'
 import net from 'node:net'
 import { Buffer } from 'node:buffer'
+import process from 'node:process'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SAFE_ROOT = path.resolve(__dirname, 'public/samples');
@@ -106,8 +107,11 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const enableLocalBridge = env.VITE_ENABLE_LOCAL_BRIDGE !== 'false';
 
+  // Use relative paths for Tauri (TAURI env is set by tauri CLI), absolute for web deployment
+  const isTauri = !!process.env.TAURI_ENV_PLATFORM;
+
   return {
-    base: '/PDFTwice/',
+    base: isTauri ? './' : '/Twice-PDF/',
     define: {
       // Expose safe root for creating file:/// links in the frontend
       // This allows functional "Open outside" links for local files without compromising the bridge security
@@ -207,5 +211,17 @@ export default defineConfig(({ mode }) => {
         },
       }
     ],
+
+    build: {
+      rollupOptions: {
+        // Suppress eval warning from pdfjs-dist (used internally for legacy compat, not a security risk in this context)
+        onwarn(warning, warn) {
+          if (warning.code === 'EVAL' && warning.id?.includes('pdfjs-dist')) {
+            return; // Ignore eval warnings from PDF.js
+          }
+          warn(warning);
+        },
+      },
+    },
   };
 })

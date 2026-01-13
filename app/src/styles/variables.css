@@ -1,0 +1,152 @@
+/**
+ * PDFViewer CSS Variables
+ * 
+ * Theme tokens for consistent styling across the PDF viewer.
+ * Switch themes by adding/removing .dark class on root element.
+ * 
+ * Usage:
+ *   background: var(--pdf-bg-primary);
+ *   color: var(--pdf-text-primary);
+ */
+
+:root {
+    /* ===== Light Theme (Default) ===== */
+    
+    /* Backgrounds */
+    --pdf-bg-primary: #ffffff;
+    --pdf-bg-secondary: #f8f9fa;
+    --pdf-bg-tertiary: #e9ecef;
+    --pdf-bg-viewer: #525659;
+    --pdf-bg-hover: rgba(0, 0, 0, 0.04);
+    --pdf-bg-active: rgba(0, 0, 0, 0.08);
+    
+    /* Text */
+    --pdf-text-primary: #212529;
+    --pdf-text-secondary: #6c757d;
+    --pdf-text-muted: #adb5bd;
+    --pdf-text-inverse: #ffffff;
+    
+    /* Borders */
+    --pdf-border-light: #e0e0e0;
+    --pdf-border-medium: #ced4da;
+    --pdf-border-focus: #4a9eff;
+    
+    /* Accent */
+    --pdf-accent-primary: #4a9eff;
+    --pdf-accent-secondary: #0d6efd;
+    --pdf-accent-success: #198754;
+    --pdf-accent-warning: #ffc107;
+    --pdf-accent-danger: #dc3545;
+    
+    /* Highlights */
+    --pdf-highlight-search: rgba(255, 230, 0, 0.5);
+    --pdf-highlight-current: rgba(255, 150, 0, 0.6);
+    --pdf-highlight-selection: rgba(0, 100, 255, 0.3);
+    --pdf-highlight-annotation: rgba(255, 235, 59, 0.4);
+    
+    /* Shadows */
+    --pdf-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+    --pdf-shadow-md: 0 2px 8px rgba(0, 0, 0, 0.1);
+    --pdf-shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.15);
+    
+    /* Toolbar */
+    --pdf-toolbar-bg: #f8f9fa;
+    --pdf-toolbar-border: #e0e0e0;
+    --pdf-toolbar-button-hover: rgba(0, 0, 0, 0.06);
+    --pdf-toolbar-button-active: rgba(0, 0, 0, 0.1);
+    
+    /* Side Panel */
+    --pdf-panel-bg: #f8f9fa;
+    --pdf-panel-header-bg: #ffffff;
+    --pdf-panel-border: #e0e0e0;
+    
+    /* Scrollbars */
+    --pdf-scrollbar-thumb: rgba(0, 0, 0, 0.2);
+    --pdf-scrollbar-thumb-hover: rgba(0, 0, 0, 0.35);
+    --pdf-scrollbar-track: transparent;
+    
+    /* Sizing */
+    --pdf-toolbar-height: 40px;
+    --pdf-sidebar-width: 280px;
+    --pdf-border-radius: 4px;
+    --pdf-border-radius-lg: 8px;
+    
+    /* Transitions */
+    --pdf-transition-fast: 100ms ease;
+    --pdf-transition-normal: 200ms ease;
+    --pdf-transition-slow: 300ms ease;
+}
+
+/* ===== Dark Theme ===== */
+:root.dark,
+.pdf-viewer.dark {
+    /* Backgrounds */
+    --pdf-bg-primary: #1e1e1e;
+    --pdf-bg-secondary: #252526;
+    --pdf-bg-tertiary: #2d2d30;
+    --pdf-bg-viewer: #1a1a1a;
+    --pdf-bg-hover: rgba(255, 255, 255, 0.06);
+    --pdf-bg-active: rgba(255, 255, 255, 0.1);
+    
+    /* Text */
+    --pdf-text-primary: #e4e4e4;
+    --pdf-text-secondary: #a0a0a0;
+    --pdf-text-muted: #6e6e6e;
+    --pdf-text-inverse: #1e1e1e;
+    
+    /* Borders */
+    --pdf-border-light: #3c3c3c;
+    --pdf-border-medium: #4a4a4a;
+    --pdf-border-focus: #4a9eff;
+    
+    /* Highlights (adjusted for dark bg) */
+    --pdf-highlight-search: rgba(255, 230, 0, 0.4);
+    --pdf-highlight-current: rgba(255, 150, 0, 0.5);
+    --pdf-highlight-selection: rgba(0, 120, 255, 0.4);
+    --pdf-highlight-annotation: rgba(255, 235, 59, 0.35);
+    
+    /* Shadows (more subtle in dark mode) */
+    --pdf-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+    --pdf-shadow-md: 0 2px 8px rgba(0, 0, 0, 0.3);
+    --pdf-shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.4);
+    
+    /* Toolbar */
+    --pdf-toolbar-bg: #252526;
+    --pdf-toolbar-border: #3c3c3c;
+    --pdf-toolbar-button-hover: rgba(255, 255, 255, 0.08);
+    --pdf-toolbar-button-active: rgba(255, 255, 255, 0.12);
+    
+    /* Side Panel */
+    --pdf-panel-bg: #252526;
+    --pdf-panel-header-bg: #2d2d30;
+    --pdf-panel-border: #3c3c3c;
+    
+    /* Scrollbars */
+    --pdf-scrollbar-thumb: rgba(255, 255, 255, 0.2);
+    --pdf-scrollbar-thumb-hover: rgba(255, 255, 255, 0.35);
+}
+
+/* ===== Custom Scrollbar Styling ===== */
+.pdf-viewer ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.pdf-viewer ::-webkit-scrollbar-track {
+    background: var(--pdf-scrollbar-track);
+}
+
+.pdf-viewer ::-webkit-scrollbar-thumb {
+    background: var(--pdf-scrollbar-thumb);
+    border-radius: 4px;
+}
+
+.pdf-viewer ::-webkit-scrollbar-thumb:hover {
+    background: var(--pdf-scrollbar-thumb-hover);
+}
+
+/* Firefox scrollbar */
+.pdf-viewer {
+    scrollbar-width: thin;
+    scrollbar-color: var(--pdf-scrollbar-thumb) var(--pdf-scrollbar-track);
+}

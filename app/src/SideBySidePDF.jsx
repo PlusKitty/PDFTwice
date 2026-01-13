@@ -1,15 +1,20 @@
+/* global __REVEAL_ABSOLUTE_PATH__, __PDF_SAMPLES_ROOT__ */
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { PDFDocument, PDFName, PDFArray, PDFString } from 'pdf-lib';
-import { AlertTriangle, X } from 'lucide-react';
+import { AlertTriangle, X, Check } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
 import 'pdfjs-dist/web/pdf_viewer.css';
 import PDFViewer from './PDFViewer';
+import { exportPDFWithAnnotations, downloadPDF, generateExportFilename, savePDFToPath } from './utils/pdfExport';
+import { PDFDocument, PDFName, PDFArray, PDFNumber } from 'pdf-lib';
+import useAnnotations from './hooks/useAnnotations';
 
 // Setup local worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
     'pdfjs-dist/build/pdf.worker.min.js',
     import.meta.url
 ).toString();
+
+
 
 const fetchPDF = async (targetUrl, proxyType = null) => {
     const allowRemote = import.meta.env.VITE_ENABLE_REMOTE_PDFS !== 'false';
@@ -22,7 +27,7 @@ const fetchPDF = async (targetUrl, proxyType = null) => {
     let res;
     try {
         res = await fetch(targetUrl);
-    } catch (e) {
+    } catch {
         // TypeError: Failed to fetch (CORS block, DNS failure, etc.)
         const err = new Error("Network Error (Possibly CORS or DNS failure)");
         err.type = 'NETWORK_ERROR';
@@ -38,7 +43,7 @@ const fetchPDF = async (targetUrl, proxyType = null) => {
             if (txt && !txt.includes('could not be fetched')) {
                 errorMsg += ` - ${txt.substring(0, 100)}`;
             }
-        } catch (e) { }
+        } catch { /* ignore text extraction errors */ }
 
         const err = new Error(errorMsg);
         err.type = 'HTTP_ERROR';
@@ -63,17 +68,131 @@ export default function SideBySidePDF() {
     const [rightScale, setRightScale] = useState(1.0);
     const [syncScroll, setSyncScroll] = useState(true);
     const [syncOffset, setSyncOffset] = useState(0);
-    const [comments, setComments] = useState({});
-    const [leftActiveComment, setLeftActiveComment] = useState(null);
-    const [leftCommentText, setLeftCommentText] = useState('');
-    const [rightActiveComment, setRightActiveComment] = useState(null);
-    const [rightCommentText, setRightCommentText] = useState('');
     const [authorName, setAuthorName] = useState(() => localStorage.getItem('pdf_author_name') || 'User');
-    const [isDirty, setIsDirty] = useState(false);
+
+    // Detect if running in Tauri
+    const isTauri = '__TAURI__' in window;
+
+    // Export settings (Tauri mode)
+    const [exportSettings, setExportSettings] = useState(() => {
+        const saved = localStorage.getItem('pdftwice_export_settings');
+        return saved ? JSON.parse(saved) : {
+            autoSaveToSource: false,
+            filenamePrefix: '',
+            filenameSuffix: '_commented'
+        };
+    });
+
+    // Annotations (comments/highlights) from hook
+    const {
+        comments,
+        setComments,
+        leftActiveComment,
+        rightActiveComment,
+        leftCommentText,
+        rightCommentText,
+        leftDirty,
+        rightDirty,
+        setLeftActiveComment,
+        setRightActiveComment,
+        setLeftCommentText,
+        setRightCommentText,
+        setLeftDirty,
+        setRightDirty,
+        addComment,
+        addHighlight,
+        saveComment,
+        deleteComment,
+    } = useAnnotations({ authorName });
+    const [leftBookmarks, setLeftBookmarks] = useState([]);
+    const [rightBookmarks, setRightBookmarks] = useState([]);
+    const lastExportedLeftBookmarks = useRef(null); // Track last exported bookmark count
+    const lastExportedRightBookmarks = useRef(null);
     const [loadingError, setLoadingError] = useState(null);
     const [isUrlLoading, setIsUrlLoading] = useState({ left: false, right: false });
+    const [toast, setToast] = useState({ visible: false, message: '' });
+
+    // Drag & Drop State
+    const [dragTarget, setDragTarget] = useState('none'); // 'none', 'left', 'right'
+
+
+    useEffect(() => {
+        if (toast.visible) {
+            const timer = setTimeout(() => {
+                setToast(prev => ({ ...prev, visible: false }));
+            }, 5000);
+            return () => clearTimeout(timer);
+        }
+    }, [toast.visible]);
+
+    // Hide inline splash screen once React mounts (works for both web and Tauri)
+    useEffect(() => {
+        const splash = document.getElementById('splash-screen');
+        if (splash) {
+            // Add hidden class for fade-out transition
+            splash.classList.add('hidden');
+            // Remove from DOM after transition
+            setTimeout(() => splash.remove(), 300);
+        }
+    }, []);
+
+    // F11 fullscreen toggle (Tauri only)
+    useEffect(() => {
+        if (!isTauri) return;
+
+        const handleKeyDown = async (e) => {
+            if (e.key === 'F11') {
+                e.preventDefault();
+                try {
+                    const win = window.__TAURI__?.window?.getCurrentWindow?.();
+                    if (win) {
+                        const isFullscreen = await win.isFullscreen();
+                        await win.setFullscreen(!isFullscreen);
+                    }
+                } catch (err) {
+                    console.warn('Failed to toggle fullscreen:', err);
+                }
+            }
+        };
+
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [isTauri]);
+
+    // Drag & Drop logic moved to after loadPdfFromPath definition to avoid ReferenceError
 
     const [viewMode, setViewMode] = useState(() => localStorage.getItem('pdf_view_mode') || 'single');
+
+    // Default Zoom Settings
+    const [scaleMode, setScaleMode] = useState(() => localStorage.getItem('pdf_scale_mode') || 'fit'); // 'fit' | 'level'
+    const [defaultScaleLevel, setDefaultScaleLevel] = useState(() => parseInt(localStorage.getItem('pdf_default_scale_level'), 10) || 100);
+
+    // Alt Text Settings (Advanced)
+    const [altTextSettings, setAltTextSettings] = useState(() => {
+        const saved = localStorage.getItem('pdf_alttext_settings');
+        return saved ? JSON.parse(saved) : {
+            showIndicator: true,
+            fallbackMode: 'spatial' // 'spatial' | 'draw'
+        };
+    });
+
+    const handleSetScaleMode = (mode) => {
+        setScaleMode(mode);
+        localStorage.setItem('pdf_scale_mode', mode);
+    };
+
+    const handleSetDefaultScaleLevel = (level) => {
+        setDefaultScaleLevel(level);
+        localStorage.setItem('pdf_default_scale_level', level);
+    };
+
+    const handleSetAltTextSettings = (updater) => {
+        setAltTextSettings(prev => {
+            const next = typeof updater === 'function' ? updater(prev) : updater;
+            localStorage.setItem('pdf_alttext_settings', JSON.stringify(next));
+            return next;
+        });
+    };
 
     const handleSetViewMode = (mode) => {
         setViewMode(mode);
@@ -88,6 +207,63 @@ export default function SideBySidePDF() {
     const leftComponentRef = useRef(null);
     const rightComponentRef = useRef(null);
 
+    // Apply default zoom when PDF loads
+    // Calculate fit scale BEFORE first render to avoid wasteful scale=1 render
+    useEffect(() => {
+        if (leftPDF) {
+            if (scaleMode === 'fit') {
+                // Calculate fit scale synchronously using RAF for DOM readiness
+                requestAnimationFrame(async () => {
+                    try {
+                        const pageObj = await leftPDF.doc.getPage(1);
+                        const viewport = pageObj.getViewport({ scale: 1.0 });
+                        const viewer = leftViewerRef.current;
+                        if (viewer) {
+                            const buffer = 4;
+                            const fitScale = Math.min(
+                                (viewer.clientWidth - buffer) / viewport.width,
+                                (viewer.clientHeight - buffer) / viewport.height
+                            );
+                            setLeftScale(Math.min(Math.max(0.25, fitScale), 3));
+                        }
+                    } catch (e) {
+                        console.warn('Failed to calculate fit scale for left PDF:', e);
+                        setLeftScale(1.0); // Fallback
+                    }
+                });
+            } else {
+                setLeftScale(defaultScaleLevel / 100);
+            }
+        }
+    }, [leftPDF, scaleMode, defaultScaleLevel]);
+
+    useEffect(() => {
+        if (rightPDF) {
+            if (scaleMode === 'fit') {
+                requestAnimationFrame(async () => {
+                    try {
+                        const pageObj = await rightPDF.doc.getPage(1);
+                        const viewport = pageObj.getViewport({ scale: 1.0 });
+                        const viewer = rightViewerRef.current;
+                        if (viewer) {
+                            const buffer = 4;
+                            const fitScale = Math.min(
+                                (viewer.clientWidth - buffer) / viewport.width,
+                                (viewer.clientHeight - buffer) / viewport.height
+                            );
+                            setRightScale(Math.min(Math.max(0.25, fitScale), 3));
+                        }
+                    } catch (e) {
+                        console.warn('Failed to calculate fit scale for right PDF:', e);
+                        setRightScale(1.0); // Fallback
+                    }
+                });
+            } else {
+                setRightScale(defaultScaleLevel / 100);
+            }
+        }
+    }, [rightPDF, scaleMode, defaultScaleLevel]);
+
     const isSyncingLeft = useRef(false);
     const isSyncingRight = useRef(false);
     const leftSyncTimeoutRef = useRef(null);
@@ -96,6 +272,24 @@ export default function SideBySidePDF() {
     // RAF throttling for smooth scroll sync
     const syncRAFRef = useRef(null);
     const pendingSyncRef = useRef(null);
+
+    const handleLeftBookmarksChange = useCallback((bm) => {
+        setLeftBookmarks(bm);
+        if (lastExportedLeftBookmarks.current !== null && bm.length !== lastExportedLeftBookmarks.current) {
+            setLeftDirty(true);
+        } else if (lastExportedLeftBookmarks.current === null && bm.length > 0) {
+            setLeftDirty(true);
+        }
+    }, [setLeftDirty]);
+
+    const handleRightBookmarksChange = useCallback((bm) => {
+        setRightBookmarks(bm);
+        if (lastExportedRightBookmarks.current !== null && bm.length !== lastExportedRightBookmarks.current) {
+            setRightDirty(true);
+        } else if (lastExportedRightBookmarks.current === null && bm.length > 0) {
+            setRightDirty(true);
+        }
+    }, [setRightDirty]);
 
     // Update URL without reloading
     const updateUrlParams = (side, url) => {
@@ -234,7 +428,20 @@ export default function SideBySidePDF() {
             };
 
             arrayBuffer = await attemptLoad();
-            const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
+
+            // Make a copy for storage - PDF.js may detach the original buffer
+            const storedData = arrayBuffer.slice(0);
+            const dataForPdfJs = arrayBuffer.slice(0);
+
+            const pdfDoc = await pdfjsLib.getDocument({ data: dataForPdfJs, isEvalSupported: false, verbosity: 0 }).promise;
+
+            // Extract PDF outline (table of contents)
+            let outline = [];
+            try {
+                outline = await pdfDoc.getOutline() || [];
+            } catch (e) {
+                console.warn('Failed to extract PDF outline:', e);
+            }
 
             let sourceUrl = null;
             if (/^https?:\/\//i.test(url)) {
@@ -250,8 +457,9 @@ export default function SideBySidePDF() {
                 doc: pdfDoc,
                 name: url.split(/[\\/]/).pop().split('?')[0] || 'Remote PDF',
                 numPages: pdfDoc.numPages,
-                data: arrayBuffer,
-                sourceUrl: sourceUrl // Store formatted URL for "Open outside"
+                data: storedData, // Use the preserved copy
+                sourceUrl: sourceUrl, // Store formatted URL for "Open outside"
+                outline: outline // PDF table of contents
             };
 
             if (side === 'left') {
@@ -282,9 +490,160 @@ export default function SideBySidePDF() {
         if (rightUrl) loadPDFFromURL(rightUrl, 'right');
     }, [loadPDFFromURL]);
 
+    // Load PDF from local file path (Tauri only)
+    const loadPdfFromPath = useCallback(async (filePath, side) => {
+        const tauri = window.__TAURI__;
+        if (!tauri?.core?.invoke) return;
+
+        try {
+            setIsUrlLoading(prev => ({ ...prev, [side]: true }));
+
+            // Use global Tauri object
+            const pdfBytes = await tauri.core.invoke('read_pdf_file', { path: filePath });
+
+
+            // Convert to Uint8Array and make a COPY for storage
+            // PDF.js may transfer buffer ownership to its worker, detaching the original
+            const originalData = new Uint8Array(pdfBytes);
+            const dataForPdfJs = originalData.slice(); // Copy for PDF.js to consume
+
+            // Load with pdf.js (may detach the buffer)
+            const loadingTask = pdfjsLib.getDocument({ data: dataForPdfJs, isEvalSupported: false, verbosity: 0 });
+            const doc = await loadingTask.promise;
+
+            // Extract filename from path
+            const fileName = filePath.split('\\').pop() || filePath.split('/').pop() || 'document.pdf';
+
+            // Get outline (bookmarks) if available
+            let outline = [];
+            try {
+                outline = await doc.getOutline() || [];
+            } catch { /* ignore outline errors */ }
+
+            const pdfData = {
+                doc,
+                data: originalData, // Use the preserved copy
+                numPages: doc.numPages,
+                name: fileName,
+                url: `file:///${filePath}`, // Kept for legacy compatibility if needed
+                sourceUrl: `file:///${filePath}`, // Required for FileInfo link and "Show in folder"
+                sourcePath: filePath, // Store original path for auto-save feature
+                outline,
+            };
+
+            if (side === 'left') {
+                setLeftPDF(pdfData);
+                setLeftPage(1);
+            } else {
+                setRightPDF(pdfData);
+                setRightPage(1);
+            }
+        } catch (err) {
+            console.error(`Failed to load PDF from path ${filePath}:`, err);
+            setLoadingError({
+                side,
+                url: filePath,
+                message: `Failed to load file: ${err.message || err}`
+            });
+        } finally {
+            setIsUrlLoading(prev => ({ ...prev, [side]: false }));
+        }
+    }, []);
+
+    // Native Drag & Drop using Tauri v2 API
+    // Uses getCurrentWebview().onDragDropEvent() instead of legacy tauri://file-drop events
+    useEffect(() => {
+        if (!isTauri) return;
+
+        const tauriWebview = window.__TAURI__?.webview;
+        if (!tauriWebview?.getCurrentWebview) return;
+
+        let unlisten = null;
+        let dragTimeout;
+
+        const setup = async () => {
+            try {
+                const webview = tauriWebview.getCurrentWebview();
+                unlisten = await webview.onDragDropEvent((event) => {
+                    const { type, paths, position } = event.payload;
+
+                    if (type === 'enter' || type === 'over') {
+                        // Determine which side based on position
+                        const width = window.innerWidth;
+                        const side = position.x < width / 2 ? 'left' : 'right';
+                        setDragTarget(side);
+
+                        // Debounce/Timeout to clear if drag leaves
+                        clearTimeout(dragTimeout);
+                        dragTimeout = setTimeout(() => {
+                            setDragTarget('none');
+                        }, 500);
+                    } else if (type === 'drop') {
+                        // Load the dropped file
+                        if (Array.isArray(paths) && paths.length > 0) {
+                            const width = window.innerWidth;
+                            const side = position.x < width / 2 ? 'left' : 'right';
+                            const pdfPath = paths.find(p => p.toLowerCase().endsWith('.pdf'));
+                            if (pdfPath) {
+                                loadPdfFromPath(pdfPath, side);
+                            }
+                        }
+                        setDragTarget('none');
+                        clearTimeout(dragTimeout);
+                    } else if (type === 'leave') {
+                        setDragTarget('none');
+                        clearTimeout(dragTimeout);
+                    }
+                });
+            } catch (err) {
+                console.warn('Failed to setup drag/drop listener:', err);
+            }
+        };
+
+        setup();
+
+        return () => {
+            clearTimeout(dragTimeout);
+            if (unlisten) unlisten();
+        };
+    }, [isTauri, loadPdfFromPath]);
+
+
+    // Load CLI argument PDFs on mount (Tauri only - fails gracefully in web mode)
+    useEffect(() => {
+        const loadCliArgs = async () => {
+            try {
+                // Use global Tauri object (set by withGlobalTauri: true)
+                const tauri = window.__TAURI__;
+                if (!tauri?.core?.invoke) return;
+
+                const paths = await tauri.core.invoke('get_cli_pdf_paths');
+
+                if (Array.isArray(paths) && paths.length > 0) {
+                    // Load first PDF on left
+                    loadPdfFromPath(paths[0], 'left');
+                    // Load second PDF on right (if provided)
+                    if (paths.length > 1) {
+                        loadPdfFromPath(paths[1], 'right');
+                    }
+                }
+            } catch (err) {
+                // Fails silently in web mode or if Tauri is not ready
+                console.error('Failed to load CLI args:', err);
+            }
+        };
+
+        loadCliArgs();
+    }, [loadPdfFromPath]);
+
     useEffect(() => {
         localStorage.setItem('pdf_author_name', authorName);
     }, [authorName]);
+
+    // Persist export settings
+    useEffect(() => {
+        localStorage.setItem('pdftwice_export_settings', JSON.stringify(exportSettings));
+    }, [exportSettings]);
 
     useEffect(() => {
         const savedComments = localStorage.getItem('pdf_comments_backup');
@@ -295,7 +654,14 @@ export default function SideBySidePDF() {
                     const confirmRestore = window.confirm("You have unsaved comments from a previous session. Would you like to restore them?");
                     if (confirmRestore) {
                         setComments(parsed);
-                        setIsDirty(true);
+                        setComments(parsed);
+                        // Start clean after restore until change? Or dirty? 
+                        // Usually restore means we have unsaved work.
+                        // We'll mark both as dirty if there are any comments for that side.
+                        const hasLeft = Object.values(parsed).some(c => c.side === 'left');
+                        const hasRight = Object.values(parsed).some(c => c.side === 'right');
+                        if (hasLeft) setLeftDirty(true);
+                        if (hasRight) setRightDirty(true);
                     } else {
                         localStorage.removeItem('pdf_comments_backup');
                     }
@@ -304,7 +670,7 @@ export default function SideBySidePDF() {
                 console.error("Failed to parse saved comments", e);
             }
         }
-    }, []);
+    }, [setComments, setLeftDirty, setRightDirty]);
 
     useEffect(() => {
         if (Object.keys(comments).length > 0) {
@@ -316,15 +682,15 @@ export default function SideBySidePDF() {
 
     useEffect(() => {
         const handleBeforeUnload = (e) => {
-            if (isDirty) {
-                const msg = "You have unsaved comments. Are you sure you want to leave?";
+            if (leftDirty || rightDirty) {
+                const msg = "You have unsaved changes. Are you sure you want to leave?";
                 e.returnValue = msg;
                 return msg;
             }
         };
         window.addEventListener('beforeunload', handleBeforeUnload);
         return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-    }, [isDirty]);
+    }, [leftDirty, rightDirty]);
 
     useEffect(() => {
         const style = document.createElement('style');
@@ -399,14 +765,29 @@ export default function SideBySidePDF() {
 
         try {
             const arrayBuffer = await file.arrayBuffer();
-            const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
+
+            // Make a copy for storage - PDF.js may detach the original buffer
+            const storedData = arrayBuffer.slice(0);
+            const dataForPdfJs = arrayBuffer.slice(0);
+
+            const pdfDoc = await pdfjsLib.getDocument({ data: dataForPdfJs, isEvalSupported: false, verbosity: 0 }).promise;
+
+            // Extract PDF outline (table of contents)
+            let outline = [];
+            try {
+                outline = await pdfDoc.getOutline() || [];
+            } catch (e) {
+                console.warn('Failed to extract PDF outline:', e);
+            }
 
             const pdfData = {
                 doc: pdfDoc,
                 name: file.name,
                 numPages: pdfDoc.numPages,
-                data: arrayBuffer,
-                sourceUrl: URL.createObjectURL(file)
+                data: storedData, // Use the preserved copy
+                sourceUrl: file.path ? `file:///${file.path}` : URL.createObjectURL(file), // Use native path if available (Tauri), else blob URL
+                sourcePath: file.path || null, // Capture native path if available
+                outline: outline // PDF table of contents
             };
 
             const extractedComments = {};
@@ -673,246 +1054,60 @@ export default function SideBySidePDF() {
         }
     };
 
-    const addComment = (side, x, y, highlightRects = null, selectedText = '', pageNum = null) => {
-        const id = `${side}-${Date.now()}`;
-        // Use the explicitly passed page number, or fall back to current page state
-        const targetPage = pageNum ?? (side === 'left' ? leftPage : rightPage);
-        const newComment = {
-            id,
-            side,
-            x,
-            y,
-            text: '',
-            highlightRects,
-            selectedText,
-            page: targetPage
-        };
-
-        if (side === 'left') {
-            setLeftActiveComment(newComment);
-            setLeftCommentText('');
-        } else {
-            setRightActiveComment(newComment);
-            setRightCommentText('');
-        }
-        setIsDirty(true);
-    };
-
-    const addHighlight = (side, x, y, highlightRects, selectedText, pageNum = null) => {
-        const id = `${side}-highlight-${Date.now()}`;
-        // Use the explicitly passed page number, or fall back to current page state
-        const targetPage = pageNum ?? (side === 'left' ? leftPage : rightPage);
-        setComments(prev => ({
-            ...prev,
-            [id]: {
-                id,
-                side,
-                x,
-                y,
-                text: '', // Empty text for pure highlight
-                highlightRects,
-                selectedText,
-                page: targetPage,
-                timestamp: new Date().toISOString(),
-                author: authorName
-            }
-        }));
-        setIsDirty(true);
-    };
-
-    const saveComment = (side) => {
-        const active = side === 'left' ? leftActiveComment : rightActiveComment;
-        const text = side === 'left' ? leftCommentText : rightCommentText;
-
-        if (active && text.trim()) {
-            setComments(prev => ({
-                ...prev,
-                [active.id]: {
-                    ...active,
-                    text: text,
-                    author: authorName,
-                    page: active.page || (side === 'left' ? leftPage : rightPage),
-                    timestamp: new Date().toISOString()
-                }
-            }));
-
-            if (side === 'left') {
-                setLeftActiveComment(null);
-                setLeftCommentText('');
-            } else {
-                setRightActiveComment(null);
-                setRightCommentText('');
-            }
-            setIsDirty(true);
-        }
-    };
-
-    const deleteComment = (id) => {
-        setComments(prev => {
-            const newComments = { ...prev };
-            delete newComments[id];
-            // Set isDirty based on whether there are still comments remaining
-            setIsDirty(Object.keys(newComments).length > 0);
-            return newComments;
-        });
-    };
+    // Note: addComment, addHighlight, saveComment, deleteComment are now provided by useAnnotations hook
 
     const processPDFAndDownload = async (side) => {
         const pdfData = side === 'left' ? leftPDF : rightPDF;
-        if (!pdfData || !pdfData.data) return;
+        if (!pdfData) {
+            console.error(`No PDF loaded on ${side} side`);
+            return;
+        }
+
+        if (!pdfData.data) return;
 
         const sideComments = Object.values(comments).filter(c => c.side === side);
-        if (sideComments.length === 0) {
-            alert(`No comments to export for the ${side} PDF.`);
+        const sideBookmarks = side === 'left' ? leftBookmarks : rightBookmarks;
+
+        // Allow export if we have comments OR bookmarks
+        if (sideComments.length === 0 && sideBookmarks.length === 0) {
+            alert(`No comments or bookmarks to export for the ${side} PDF.`);
             return;
         }
 
         try {
-            const pdfDoc = await PDFDocument.load(pdfData.data);
+            // Use pdfExport utility for the heavy lifting
+            const pdfBytes = await exportPDFWithAnnotations(
+                pdfData.data,
+                sideComments,
+                sideBookmarks
+            );
 
-            for (const comment of sideComments) {
-                const pageIndex = comment.page - 1;
-                if (pageIndex < 0 || pageIndex >= pdfDoc.getPageCount()) continue;
+            // Generate filename with prefix/suffix from settings
+            const filename = generateExportFilename(
+                pdfData.name,
+                exportSettings.filenamePrefix,
+                exportSettings.filenameSuffix
+            );
 
-                const page = pdfDoc.getPage(pageIndex);
-                const { width, height } = page.getSize();
-
-                const x = (comment.x / 100) * width;
-                const y = height - ((comment.y / 100) * height);
-
-                const formatPDFDate = (date) => {
-                    const pad = (n) => n.toString().padStart(2, '0');
-                    const year = date.getFullYear();
-                    const month = pad(date.getMonth() + 1);
-                    const day = pad(date.getDate());
-                    const hours = pad(date.getHours());
-                    const minutes = pad(date.getMinutes());
-                    const seconds = pad(date.getSeconds());
-                    const tzOffset = -date.getTimezoneOffset();
-                    const tzSign = tzOffset >= 0 ? '+' : '-';
-                    const tzHours = pad(Math.floor(Math.abs(tzOffset) / 60));
-                    const tzMins = pad(Math.abs(tzOffset) % 60);
-                    return `D:${year}${month}${day}${hours}${minutes}${seconds}${tzSign}${tzHours}'${tzMins}'`;
-                };
-
-                const commentDate = comment.timestamp ? new Date(comment.timestamp) : new Date();
-                const highlightColor = [1, 1, 0];
-                const annotId = `annot-${comment.id}-${Date.now()}`;
-
-                let annot;
-                let annotRect;
-
-                if (comment.highlightRects || comment.highlightRect) {
-                    const rects = comment.highlightRects || [comment.highlightRect];
-                    const quadPoints = [];
-                    let minL = Infinity, minB = Infinity, maxR = -Infinity, maxT = -Infinity;
-
-                    for (const hr of rects) {
-                        const left = (hr.left / 100) * width;
-                        const right = (hr.right / 100) * width;
-                        const top = height - ((hr.top / 100) * height);
-                        const bottom = height - ((hr.bottom / 100) * height);
-
-                        quadPoints.push(left, top, right, top, left, bottom, right, bottom);
-
-                        minL = Math.min(minL, left);
-                        minB = Math.min(minB, bottom);
-                        maxR = Math.max(maxR, right);
-                        maxT = Math.max(maxT, top);
-                    }
-
-                    annotRect = [minL, minB, maxR, maxT];
-
-                    annot = pdfDoc.context.obj({
-                        Type: PDFName.of('Annot'),
-                        Subtype: PDFName.of('Highlight'),
-                        NM: PDFString.of(annotId),
-                        Rect: annotRect,
-                        QuadPoints: quadPoints,
-                        Contents: PDFString.of(comment.text || ''),
-                        C: highlightColor,
-                        CA: 0.4,
-                        F: 4,
-                        T: PDFString.of(comment.author || 'Author'),
-                        M: PDFString.of(formatPDFDate(commentDate)),
-                        CreationDate: PDFString.of(formatPDFDate(commentDate)),
-                    });
-                } else {
-                    annotRect = [x, y - 20, x + 20, y];
-
-                    annot = pdfDoc.context.obj({
-                        Type: PDFName.of('Annot'),
-                        Subtype: PDFName.of('Text'),
-                        NM: PDFString.of(annotId),
-                        Rect: annotRect,
-                        Contents: PDFString.of(comment.text || ''),
-                        C: highlightColor,
-                        Name: PDFName.of('Comment'),
-                        Open: false,
-                        F: 4,
-                        T: PDFString.of(comment.author || 'Author'),
-                        M: PDFString.of(formatPDFDate(commentDate)),
-                        CreationDate: PDFString.of(formatPDFDate(commentDate)),
-                    });
-                }
-
-                const annotRef = pdfDoc.context.register(annot);
-
-                // Only add popup if there is text content
-                if (comment.text && comment.text.trim()) {
-                    const popupRect = [
-                        annotRect[2],
-                        annotRect[1],
-                        annotRect[2] + 200,
-                        annotRect[1] + 100
-                    ];
-
-                    const popup = pdfDoc.context.obj({
-                        Type: PDFName.of('Annot'),
-                        Subtype: PDFName.of('Popup'),
-                        Rect: popupRect,
-                        Parent: annotRef,
-                        Open: false,
-                        F: 0,
-                    });
-
-                    const popupRef = pdfDoc.context.register(popup);
-                    annot.set(PDFName.of('Popup'), popupRef);
-
-                    const existingAnnots = page.node.lookup(PDFName.of('Annots'));
-                    if (existingAnnots instanceof PDFArray) {
-                        existingAnnots.push(annotRef);
-                        existingAnnots.push(popupRef);
-                    } else {
-                        const newAnnots = pdfDoc.context.obj([annotRef, popupRef]);
-                        page.node.set(PDFName.of('Annots'), newAnnots);
-                    }
-                } else {
-                    // Just add the annotation
-                    const existingAnnots = page.node.lookup(PDFName.of('Annots'));
-                    if (existingAnnots instanceof PDFArray) {
-                        existingAnnots.push(annotRef);
-                    } else {
-                        const newAnnots = pdfDoc.context.obj([annotRef]);
-                        page.node.set(PDFName.of('Annots'), newAnnots);
-                    }
-                }
+            // Tauri auto-save mode: write directly to source folder
+            if (isTauri && exportSettings.autoSaveToSource && pdfData.sourcePath) {
+                const dir = pdfData.sourcePath.substring(0, pdfData.sourcePath.lastIndexOf('\\'));
+                const outputPath = `${dir}\\${filename}`;
+                await savePDFToPath(pdfBytes, outputPath);
+                setToast({ visible: true, message: `Saved as ${filename}` });
+            } else {
+                // Standard browser download
+                downloadPDF(pdfBytes, filename);
             }
 
-            const pdfBytes = await pdfDoc.save();
-            const blob = new Blob([pdfBytes], { type: 'application/pdf' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-
-            const nameParts = pdfData.name.split('.');
-            const baseName = nameParts.length > 1 ? nameParts.slice(0, -1).join('.') : nameParts[0];
-            a.download = `${baseName}_commented.pdf`;
-
-            a.click();
-            URL.revokeObjectURL(url);
-
-            setIsDirty(false);
+            // Mark bookmarks as exported (saved)
+            if (side === 'left') {
+                lastExportedLeftBookmarks.current = leftBookmarks.length;
+                setLeftDirty(false);
+            } else {
+                lastExportedRightBookmarks.current = rightBookmarks.length;
+                setRightDirty(false);
+            }
             localStorage.removeItem('pdf_comments_backup');
         } catch (err) {
             console.error(`Error exporting ${side} PDF:`, err);
@@ -940,7 +1135,30 @@ export default function SideBySidePDF() {
                 </div>
             )}
 
-            <main className="flex-1 flex overflow-hidden">
+            <main className="flex-1 flex overflow-hidden relative">
+                {/* Drag Overlay - positioned relative to main content area */}
+                {dragTarget !== 'none' && (
+                    <div className="absolute inset-0 z-50 pointer-events-none flex">
+                        {/* Left Overlay */}
+                        <div
+                            className={`flex-1 transition-all duration-200 border-4 border-dashed rounded-lg mx-4 mb-4 mt-8 flex items-center justify-center
+                                ${dragTarget === 'left'
+                                    ? 'border-blue-500 bg-blue-50/90'
+                                    : 'border-transparent bg-transparent'
+                                }`}
+                        />
+
+                        {/* Right Overlay */}
+                        <div
+                            className={`flex-1 transition-all duration-200 border-4 border-dashed rounded-lg mx-4 mb-4 mt-8 flex items-center justify-center
+                                ${dragTarget === 'right'
+                                    ? 'border-blue-500 bg-blue-50/90'
+                                    : 'border-transparent bg-transparent'
+                                }`}
+                        />
+                    </div>
+                )}
+
                 <PDFViewer
                     className="flex-1 border-r border-gray-300 relative"
                     ref={leftComponentRef} // Use Component Ref
@@ -968,13 +1186,38 @@ export default function SideBySidePDF() {
                     syncScroll={syncScroll}
                     setSyncScroll={handleToggleSync}
                     hasComments={Object.values(comments).some(c => c.side === 'left')}
-                    isDirty={isDirty}
+                    hasBookmarks={leftBookmarks.length > 0}
+                    onBookmarksChange={handleLeftBookmarksChange}
+                    isDirty={leftDirty}
                     authorName={authorName}
                     setAuthorName={setAuthorName}
                     onClose={() => setLeftPDF(null)}
-                    onLoadFromUrl={(url) => loadPDFFromURL(url, 'left')}
+                    onLoadFromUrl={(url) => {
+                        // Strip surrounding quotes only if both present (Windows 11 "Copy as path" adds them)
+                        let cleanUrl = url.trim();
+                        if (cleanUrl.startsWith('"') && cleanUrl.endsWith('"')) {
+                            cleanUrl = cleanUrl.slice(1, -1);
+                        }
+                        const isRemote = cleanUrl.startsWith('http://') || cleanUrl.startsWith('https://');
+                        if (isTauri && !isRemote) {
+                            loadPdfFromPath(cleanUrl, 'left');
+                        } else {
+                            loadPDFFromURL(cleanUrl, 'left');
+                        }
+                    }}
                     onFitToPage={() => handleFitToPageSync('left')}
                     isLoading={isUrlLoading.left}
+                    exportSettings={exportSettings}
+                    setExportSettings={setExportSettings}
+                    isTauri={isTauri}
+                    // Scale Settings
+                    scaleMode={scaleMode}
+                    setScaleMode={handleSetScaleMode}
+                    defaultScaleLevel={defaultScaleLevel}
+                    setDefaultScaleLevel={handleSetDefaultScaleLevel}
+                    // Alt Text Settings
+                    altTextSettings={altTextSettings}
+                    setAltTextSettings={handleSetAltTextSettings}
                 />
                 <PDFViewer
                     className="flex-1 relative"
@@ -1003,15 +1246,56 @@ export default function SideBySidePDF() {
                     syncScroll={syncScroll}
                     setSyncScroll={handleToggleSync}
                     hasComments={Object.values(comments).some(c => c.side === 'right')}
-                    isDirty={isDirty}
+                    hasBookmarks={rightBookmarks.length > 0}
+                    onBookmarksChange={handleRightBookmarksChange}
+                    isDirty={rightDirty}
                     authorName={authorName}
                     setAuthorName={setAuthorName}
                     onClose={() => setRightPDF(null)}
-                    onLoadFromUrl={(url) => loadPDFFromURL(url, 'right')}
+                    onLoadFromUrl={(url) => {
+                        // Strip surrounding quotes only if both present (Windows 11 "Copy as path" adds them)
+                        let cleanUrl = url.trim();
+                        if (cleanUrl.startsWith('"') && cleanUrl.endsWith('"')) {
+                            cleanUrl = cleanUrl.slice(1, -1);
+                        }
+                        const isRemote = cleanUrl.startsWith('http://') || cleanUrl.startsWith('https://');
+                        if (isTauri && !isRemote) {
+                            loadPdfFromPath(cleanUrl, 'right');
+                        } else {
+                            loadPDFFromURL(cleanUrl, 'right');
+                        }
+                    }}
                     onFitToPage={() => handleFitToPageSync('right')}
                     isLoading={isUrlLoading.right}
+                    // Scale Settings (passed but only Left side triggers settings menu changes usually, but good for consistency)
+                    scaleMode={scaleMode}
+                    setScaleMode={handleSetScaleMode}
+                    defaultScaleLevel={defaultScaleLevel}
+                    setDefaultScaleLevel={handleSetDefaultScaleLevel}
+                    // Alt Text Settings
+                    altTextSettings={altTextSettings}
+                    setAltTextSettings={handleSetAltTextSettings}
                 />
             </main>
+
+            {toast.visible && (
+                <div className="fixed bottom-6 right-6 z-[100] animate-in slide-in-from-right fade-in duration-300">
+                    <div className="bg-blue-600 text-white px-4 py-3 rounded-none shadow-2xl flex items-center gap-3 min-w-[300px] border-l-4 border-blue-400">
+                        <div className="bg-white/20 p-1 rounded-none">
+                            <Check className="w-4 h-4 text-white" />
+                        </div>
+                        <div className="flex-1">
+                            <p className="text-sm font-medium leading-tight">{toast.message}</p>
+                        </div>
+                        <button
+                            onClick={() => setToast(prev => ({ ...prev, visible: false }))}
+                            className="text-white/70 hover:text-white transition-colors ml-2"
+                        >
+                            <X className="w-4 h-4" />
+                        </button>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

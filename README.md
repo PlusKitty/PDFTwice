@@ -1,57 +1,60 @@
-# <img src="app/public/favicon.ico" width="40" height="40" style="vertical-align: text-bottom;"> PDFTwice
+# <img src="app/public/favicon.ico" width="40" height="40" style="vertical-align: text-bottom;"> Twice PDF
 
-A minimalist productivity tool to view PDFs side by side. Built for QC, translation checks, and version comparison. Try it [here](https://pluskitty.github.io/PDFTwice)!
+A lightweight PDF viewer and annotator with synced side-by-side view. Built for QC, translation checks, and version comparison. Try it online [here](https://pluskits.github.io/Twice-PDF)!
 
-![PDFTwice Screenshot](app/public/screenshot/Main%20view.png)
+![Twice PDF Screenshot](app/public/screenshot/Main%20view.png)
 
 ---
+### 🎁 Ready to Use
 
+
+ * **Instant web access**.
+* **Private and local**.
+* **Open source and ad free**.
 ## ✨ For Users
 
-### 🎁 Ready to Use
-| Feature | Why It Matters |
-|:--------|:---------------|
-| **No Install Required** | Open the web app and start comparing; nothing to download or configure. |
-| **100% Private** | Your PDFs never leave your browser. All processing happens locally. |
-| **Ad-Free** | Clean interface, no distractions. Focus on your documents. |
-| **Free & Open Source** | Use it forever, for free. Inspect the code anytime. |
-| **Offline Capable** | Once loaded, works without an internet connection. |
 
 ### 🔍 Core Features
 
-- **Dual View**: Two PDFs side-by-side for effortless comparison
-- **Synced Scrolling**: Lock scroll, zoom, and navigation between panels
-- **Instant Search**: Find text with context previews and page numbers
-- **Fit to Page**: One-click zoom to fit page in viewport
-- **View Modes**: Toggle between page-by-page or continuous scroll
+- **Side by side**: Compare two PDFs in the same viewer
+- **Synced view**: Simultaneous scroll, zoom, and page navigation
+- **Search**: Find and navigate to any string
+- **Bookmarks sidebar**: Browse and create custom bookmarks and ToC outline
+- **Annotations sidebar**: View all sticky notes, comments, and highlights
+- **View modes**: Switch between page-by-page rendering or continuous scroll
+- **Session recovery**: Comments get autosaved and restored when you come back
+- **Accessibility**: Show alt text on hover, with an optional visual indicator
+- **Automation friendly**: Load remote and local PDFs on the web version like this: `?a=doc1.pdf&b=doc2.pdf` or use command line arguments with the desktop app.
 
 ### 💬 Annotations & Review
 
-- **Sticky Notes**: Double-click to add comments anywhere
-- **Text Highlighting**: Select text to highlight and add comments
-- **Custom Author**: Your name persists across sessions
-- **One-Click Export**: Download annotated PDFs instantly
+- **Sticky notes**: Double click to add comments anywhere on the page
+- **Text annotations**: Select text to highlight or add comments
+- **Custom author**: Change your name so your comments are easily identifiable
+- **Export**: Download annotated PDFs with your changes
 
-### 🔄 Session & Sharing
-
-- **Session Recovery**: Comments auto-save—restored if you close the tab
-- **URL-Based Loading**: Share via `?a=doc1.pdf&b=doc2.pdf`
-- **Unsaved Changes Warning**: Prompted before losing work
+### 🖥️ Desktop App
+Twice PDF is available as a native Windows application powered by **Tauri**.
+- **CLI Support**: Open PDFs via command line: `Twice-PDF.exe doc1.pdf doc2.pdf`
+- **Native I/O**: Direct file access including "save to source" functionality with configurable naming patterns.
+- **Fully offline**: No online capabilities necessary to view and save PDFs.
+- **Minimal footprint**: Tauri uses the OS native web viewer, avoiding Electron-like embedding for a 95% smaller bundle size, 60-90% less memory usage, and automatic browser updates. The Windows app is **under 15 MB**!
 
 ---
 
 ## 🛠 For Developers & Teams
 
-### 💡 Why Choose PDFTwice?
+### 💡 Why Choose Twice PDF?
 
-| Quality | What It Means |
-|:--------|:--------------|
+|   |   |
+|---|---|
 | **Lightweight** | ~150KB gzipped. Minimal dependencies. |
-| **Flexible** | URL parameters, env configs, extensible architecture. |
+| **Flexible** | URL and CLI parameters, env configs, extensible architecture. |
 | **Bespoke** | Modern, sleek UI. Flat design. Easily themed. |
 | **Scalable** | Lazy rendering with IntersectionObserver. Handles large documents. |
 | **Robust** | Multi-proxy CORS fallback, SSRF protection, DNS pinning. |
 | **Secure** | Private IP filtering, path traversal protection, feature flags. |
+| **Modular** | 25+ focused modules: SearchPanel, AnnotationOverlay, useAnnotations, pdfExport, etc. |
 
 ### 🏗 Architecture Highlights
 
@@ -59,7 +62,7 @@ A minimalist productivity tool to view PDFs side by side. Built for QC, translat
 - **PDF.js Bundled Locally**: No CDN calls—faster, private, offline-ready
 - **Smooth Zoom Engine**: CSS transform for instant feedback + debounced re-render
 - **RAF-Throttled Sync**: `requestAnimationFrame` scroll handling prevents flooding
-- **Memory Management**: Off-screen page unloading in continuous mode
+- **Memory Management**: Off-screen page unloading
 - **Canvas Size Guard**: Prevents browser crashes on oversized pages
 - **Error Boundary**: Graceful error handling with retry UI
 
@@ -91,8 +94,7 @@ A minimalist productivity tool to view PDFs side by side. Built for QC, translat
 Remote PDFs use a fallback chain of public proxies:
 1. Direct fetch → 2. AllOrigins → 3. CORS.lol → 4. corsproxy.io
 
-> [!WARNING]
-> When using "Load from URL", content may pass through third-party proxies. For sensitive documents, **download locally and upload manually**.
+ When direct fetch fails due to a CORS error, "Load from URL" will pass the PDF through third-party proxies. For sensitive documents, **download and upload manually**.
 
 ---
 
@@ -104,10 +106,14 @@ Remote PDFs use a fallback chain of public proxies:
 ### Installation
 
 ```bash
-git clone https://github.com/PlusKitty/PDFTwice.git
-cd PDFTwice/app
+git clone https://github.com/PlusKits/Twice-PDF.git
+cd Twice-PDF/app
 npm install
 npm run dev
+
+# For Desktop App
+npm run tauri:dev   # Debug mode
+npm run tauri:build # Release build
 ```
 
 Open `http://localhost:5173` in your browser.
@@ -119,16 +125,16 @@ http://localhost:5173/?a=file1.pdf&b=file2.pdf
 ```
 
 > [!NOTE]
-> The local bridge only serves files from `app/public/samples` for security.
+> The Vite local bridge only serves files from `app/public/samples` for security. The base path can be configured.
 
 ---
 
 ## 🌐 Deployment
 
-Deploy as a static site on [GitHub Pages](https://pages.github.com/), [Vercel](https://vercel.com/), or [Netlify](https://www.netlify.com/).
+Deploy as a static site on [GitHub Pages](https://pages.github.com/), [Vercel](https://vercel.com/), or [Netlify](https://www.netlify.com/). Deploy as a Windows executable via our GitHub releases.
 
 > [!NOTE]
-> The "Local Bridge" feature is only available when running the Vite dev server.
+> Local path functionality is only available through the Vite dev server and desktop app due to browser security restrictions.
 
 ---
 
@@ -148,6 +154,18 @@ If you are a business, we can talk too.
 Contact: pluskittydev [at] gmail [dot] com
 
 See [LICENSE](LICENSE) for full details.
+
+---
+
+## 📋 Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for complete version history.
+
+**Latest Updates (January 2026):**
+- **Desktop Support**: Native Windows app with Tauri (CLI args, native file access).
+- **Accessibility**: Alt text extraction, visualization, and fallback heuristics.
+- **Architecture**: Major refactor into 25+ modular components.
+- **Panels**: New Bookmarks and Annotations sidebars.
 
 -----
 ### Screenshots 

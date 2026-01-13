@@ -1,17 +1,106 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
-    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
-    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
-    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
-    <link rel="manifest" href="/site.webmanifest" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PDFTwice</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
+
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Twice PDF</title>
+  <style>
+    /* Prevent white flash */
+    html,
+    body {
+      background-color: #f3f4f6;
+    }
+
+    /* Inline splash screen - renders immediately before JS loads */
+    #splash-screen {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #f3f4f6;
+      z-index: 99999;
+      transition: opacity 0.3s ease-out;
+    }
+
+    #splash-screen.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .splash-content {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      color: #212529;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    .splash-content img {
+      width: 80px;
+      height: 80px;
+      margin-bottom: 24px;
+    }
+
+    .splash-content .app-name {
+      font-size: 24px;
+      font-weight: 600;
+      margin-bottom: 24px;
+      color: #212529;
+    }
+
+    .splash-content .loading-bar {
+      width: 200px;
+      height: 4px;
+      background: rgba(239, 68, 68, 0.2);
+      border-radius: 2px;
+      margin: 0 auto;
+      overflow: hidden;
+    }
+
+    .splash-content .loading-bar::after {
+      content: '';
+      display: block;
+      width: 40%;
+      height: 100%;
+      background: #ef4444;
+      border-radius: 2px;
+      animation: loading 1.5s ease-in-out infinite;
+    }
+
+    @keyframes loading {
+      0% {
+        transform: translateX(-100%);
+      }
+
+      100% {
+        transform: translateX(350%);
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <!-- Inline splash screen - visible immediately -->
+  <div id="splash-screen">
+    <div class="splash-content">
+      <img src="/icon.png" alt="Logo" />
+      <div class="app-name">Twice PDF</div>
+      <div class="loading-bar"></div>
+    </div>
+  </div>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+
 </html>

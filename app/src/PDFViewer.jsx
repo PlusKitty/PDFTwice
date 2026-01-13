@@ -1,145 +1,138 @@
 import React, { useState, useRef, useEffect, useCallback, useImperativeHandle, forwardRef } from 'react';
-import { Upload, Lock, Unlock, MessageSquare, X, Download, ZoomIn, ZoomOut, ChevronLeft, ChevronRight, RotateCcw, Settings, AlertTriangle, Trash2, Search, Loader2, Maximize, Maximize2, Highlighter, Send, ExternalLink, Github } from 'lucide-react';
+import 'pdfjs-dist/web/pdf_viewer.css';
+import { MessageSquare, X, ChevronLeft, ChevronRight, Settings, Trash2, Search, Send, PanelLeft } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
+// Note: Using window.__TAURI__.opener.openUrl() for external links, window.__TAURI__.core.invoke() for other calls
+import SidePanel from './components/SidePanel';
+import BookmarksPanel from './components/BookmarksPanel';
+import AnnotationsPanel from './components/AnnotationsPanel';
+import useBookmarks from './hooks/useBookmarks';
+import useClickOutside from './hooks/useClickOutside';
+
+import TextLayerSelectionManager from './utils/TextLayerSelectionManager';
+import SelectionPopover from './components/PDFViewer/SelectionPopover';
+import AnnotationOverlay from './components/PDFViewer/AnnotationOverlay';
+import SearchPanel from './components/PDFViewer/SearchPanel';
+import UploadZone from './components/PDFViewer/UploadZone';
+import {
+    SettingsMenu,
+    PanelsMenu,
+    ZoomControls,
+    PageNavigation,
+    FileInfo,
+    UtilityButtons
+} from './components/PDFViewer/Toolbar';
+import { getPageImages } from './utils/pdfImageAltText';
 
 /**
- * TextLayerSelectionManager - Ported from PDF.js text_layer_builder.js
- * Handles Chrome-compatible text selection by dynamically moving endOfContent element
- * to prevent selection "jumping" when cursor moves into empty space.
- * Firefox handles selection natively, so we skip the Chrome-specific manipulation.
+ * SimpleLinkService - Minimal PDF.js link service for internal link navigation
+ * Handles clicking internal PDF links (table of contents, cross-references, etc.)
  */
-const TextLayerSelectionManager = (() => {
-    const textLayers = new Map(); // Map<textLayerDiv, endOfContentDiv>
-    let selectionChangeAbortController = null;
-    let prevRange = null;
-    let isFirefox = null; // Lazily detected
 
-    const reset = (endDiv, textLayerDiv) => {
-        textLayerDiv.append(endDiv);
-        endDiv.style.width = "";
-        endDiv.style.height = "";
-        textLayerDiv.classList.remove("selecting");
-    };
+// Minimal stub for PDF.js AnnotationLayer (required interface, but we don't use downloads)
+const downloadManager = {
+    downloadUrl() { },
+    downloadData() { },
+    openOrDownloadData() { return false; },
+    download() { }
+};
 
-    const enableGlobalListener = () => {
-        if (selectionChangeAbortController) return; // Already enabled
+class SimpleLinkService {
+    constructor() {
+        this.externalLinkRel = 'noopener noreferrer';
+        this.pdfDoc = null;
+        this.navigateToPage = null; // Callback set by PDFViewer
+        this.onLinkHover = null;    // Callback for link hover
+        this.isTauri = false;
+    }
 
-        selectionChangeAbortController = new AbortController();
-        const { signal } = selectionChangeAbortController;
+    setDocument(pdfDoc) { this.pdfDoc = pdfDoc; }
+    get pagesCount() { return this.pdfDoc?.numPages || 0; }
+    get externalLinkEnabled() { return true; }
 
-        let isPointerDown = false;
+    getDestinationHash(dest) {
+        // External URLs pass through unchanged
+        if (typeof dest === 'string' && /^(https?:|mailto:|\/\/)/.test(dest)) {
+            return dest;
+        }
+        // Internal destinations: encode as JSON in hash
+        return '#' + encodeURIComponent(JSON.stringify(dest));
+    }
 
-        document.addEventListener("pointerdown", () => { isPointerDown = true; }, { signal });
-        document.addEventListener("pointerup", () => {
-            isPointerDown = false;
-            textLayers.forEach(reset);
-        }, { signal });
-        window.addEventListener("blur", () => {
-            isPointerDown = false;
-            textLayers.forEach(reset);
-        }, { signal });
-        document.addEventListener("keyup", () => {
-            if (!isPointerDown) textLayers.forEach(reset);
-        }, { signal });
+    getAnchorUrl(dest) { return this.getDestinationHash(dest); }
+    setHash() { } // No-op
+    executeNamedAction() { } // No-op (NextPage/PrevPage rarely used, requires page sync)
+    executeSetOCGState() { } // No-op
 
-        document.addEventListener("selectionchange", () => {
-            const selection = document.getSelection();
-            if (selection.rangeCount === 0) {
-                textLayers.forEach(reset);
+    addLinkAttributes(link, url) {
+        link.href = url;
+
+        // Add hover handlers for preview
+        if (this.onLinkHover) {
+            link.onmouseenter = () => this.onLinkHover(url);
+            link.onmouseleave = () => this.onLinkHover(null);
+        }
+
+        if (url?.startsWith('#') && url.length > 1) {
+            // Internal link: handle click manually
+            link.onclick = (e) => {
+                e.preventDefault();
+                try {
+                    const dest = JSON.parse(decodeURIComponent(url.slice(1)));
+                    this.navigateTo(dest);
+                } catch { /* ignore malformed */ }
+            };
+        } else if (url && !url.startsWith('#')) {
+            // External link
+            link.target = '_blank';
+            link.rel = this.externalLinkRel;
+
+            // If in Tauri, use opener plugin to open in default browser
+            if (this.isTauri) {
+                link.onclick = (e) => {
+                    e.preventDefault();
+                    const opener = window.__TAURI__?.opener;
+                    if (opener?.openUrl) {
+                        opener.openUrl(url).catch(console.error);
+                    }
+                };
+            }
+        }
+    }
+
+    async goToDestination(dest) { await this.navigateTo(dest); }
+    goToPage(val) { if (typeof val === 'number') this.navigateToPage?.(val); }
+
+    async navigateTo(dest) {
+        if (!this.pdfDoc || !this.navigateToPage) return;
+        try {
+            // Resolve named destinations
+            const resolved = typeof dest === 'string'
+                ? await this.pdfDoc.getDestination(dest)
+                : dest;
+
+            if (!resolved) {
+                // Direct page number fallback
+                if (typeof dest === 'number') this.navigateToPage(dest + 1);
                 return;
             }
 
-            // Find active text layers
-            const activeTextLayers = new Set();
-            for (let i = 0; i < selection.rangeCount; i++) {
-                const range = selection.getRangeAt(i);
-                for (const textLayerDiv of textLayers.keys()) {
-                    if (!activeTextLayers.has(textLayerDiv) && range.intersectsNode(textLayerDiv)) {
-                        activeTextLayers.add(textLayerDiv);
-                    }
-                }
-            }
+            // Extract page ref from destination array [Ref, Name, ...args]
+            const ref = Array.isArray(resolved) ? resolved[0] : resolved;
+            const pageIndex = await this.pdfDoc.getPageIndex(ref);
+            if (pageIndex !== -1) this.navigateToPage(pageIndex + 1);
+        } catch { /* ignore navigation errors */ }
+    }
 
-            for (const [textLayerDiv, endDiv] of textLayers) {
-                if (activeTextLayers.has(textLayerDiv)) {
-                    textLayerDiv.classList.add("selecting");
-                } else {
-                    reset(endDiv, textLayerDiv);
-                }
-            }
+    // Stubs for PDF.js interface compatibility
+    cachePageRef() { }
+    isPageVisible() { return true; }
+    isPageCached() { return true; }
+}
 
-            // Firefox handles selection natively - skip Chrome-specific manipulation
-            if (isFirefox === null) {
-                // Detect Firefox using -moz-user-select CSS property (same as PDF.js)
-                const firstTextLayer = textLayers.keys().next().value;
-                if (firstTextLayer) {
-                    isFirefox = getComputedStyle(firstTextLayer).getPropertyValue("-moz-user-select") !== "";
-                }
-            }
-            if (isFirefox) return;
+// Create a singleton link service instance for internal link handling
+const linkService = new SimpleLinkService();
 
-            // Chrome-specific: Move endOfContent to follow selection anchor
-            // This prevents selection from jumping to cover all text
-            const range = selection.getRangeAt(0);
-            const modifyStart = prevRange && (
-                range.compareBoundaryPoints(Range.END_TO_END, prevRange) === 0 ||
-                range.compareBoundaryPoints(Range.START_TO_END, prevRange) === 0
-            );
-
-            let anchor = modifyStart ? range.startContainer : range.endContainer;
-            if (anchor.nodeType === Node.TEXT_NODE) {
-                anchor = anchor.parentNode;
-            }
-
-            if (!modifyStart && range.endOffset === 0) {
-                try {
-                    while (!anchor.previousSibling) {
-                        anchor = anchor.parentNode;
-                    }
-                    anchor = anchor.previousSibling;
-                    while (anchor.childNodes && anchor.childNodes.length) {
-                        anchor = anchor.lastChild;
-                    }
-                } catch (e) { /* ignore navigation errors */ }
-            }
-
-            const parentTextLayer = anchor?.parentElement?.closest(".textLayer");
-            const endDiv = textLayers.get(parentTextLayer);
-            if (endDiv && parentTextLayer) {
-                endDiv.style.width = parentTextLayer.style.width;
-                endDiv.style.height = parentTextLayer.style.height;
-                endDiv.style.userSelect = "text";
-                try {
-                    anchor.parentElement?.insertBefore(endDiv, modifyStart ? anchor : anchor.nextSibling);
-                } catch (e) { /* ignore DOM errors */ }
-            }
-
-            prevRange = range.cloneRange();
-        }, { signal });
-    };
-
-    return {
-        register(textLayerDiv, endOfContentDiv) {
-            textLayers.set(textLayerDiv, endOfContentDiv);
-
-            textLayerDiv.addEventListener("mousedown", () => {
-                textLayerDiv.classList.add("selecting");
-            });
-
-            enableGlobalListener();
-        },
-
-        unregister(textLayerDiv) {
-            textLayers.delete(textLayerDiv);
-            if (textLayers.size === 0 && selectionChangeAbortController) {
-                selectionChangeAbortController.abort();
-                selectionChangeAbortController = null;
-                prevRange = null;
-                isFirefox = null; // Reset for next registration cycle
-            }
-        }
-    };
-})();
 const PDFViewer = forwardRef(({
     pdf,
     side,
@@ -163,6 +156,7 @@ const PDFViewer = forwardRef(({
     syncScroll,
     setSyncScroll,
     hasComments,
+    hasBookmarks: hasBookmarksProp, // From parent - for export button visibility
     isDirty,
     authorName,
     setAuthorName,
@@ -173,7 +167,18 @@ const PDFViewer = forwardRef(({
     viewMode = 'single', // 'single' | 'continuous'
     setViewMode,
     className,
+    onBookmarksChange, // Callback when bookmarks change
+    exportSettings,     // Export settings (Tauri mode)
+    setExportSettings,  // Setter for export settings
+    isTauri = false,    // Whether running in Tauri
+    scaleMode,          // 'fit' | 'level'
+    setScaleMode,
+    defaultScaleLevel,
+    setDefaultScaleLevel,
+    altTextSettings,    // { showIndicator, fallbackMode }
+    setAltTextSettings,
 }, ref) => {
+
     const numPages = pdf?.numPages || 0;
     const [selectionBtn, setSelectionBtn] = useState({ show: false, x: 0, y: 0 });
     const [hoveredCommentId, setHoveredCommentId] = useState(null);
@@ -217,6 +222,19 @@ const PDFViewer = forwardRef(({
     const [isBlinking, setIsBlinking] = useState(false);
     const [copyFeedback, setCopyFeedback] = useState(null);
 
+    // Panel visibility state
+    const [showBookmarks, setShowBookmarks] = useState(false);
+    const [showAnnotations, setShowAnnotations] = useState(false);
+    const [leftPanelWidth, setLeftPanelWidth] = useState(168);
+    const [rightPanelWidth, setRightPanelWidth] = useState(168);
+    const [showPanelsMenu, setShowPanelsMenu] = useState(false);
+
+    // Bookmarks hook (user-defined bookmarks)
+    const pdfId = pdf?.name ? pdf.name.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase() : null;
+    const { bookmarks, addBookmark, removeBookmark, renameBookmark } = useBookmarks(pdfId, onBookmarksChange);
+
+    const [hoveredLink, setHoveredLink] = useState(null);
+
     const activeCommentRef = useRef(null);
 
     // Internal Ref if not provided
@@ -240,6 +258,12 @@ const PDFViewer = forwardRef(({
     const visiblePages = useRef(new Set());
     const preRenderingPages = useRef(new Set()); // Track pages currently being pre-rendered
     const idleCallbackRef = useRef(null); // Track idle callback for cleanup
+
+    // Render Queue (prevents overwhelming main thread on fast scroll)
+    const renderingPages = useRef(new Set()); // Currently rendering
+    const renderQueue = useRef([]); // Pending render requests
+    const renderTasksRef = useRef(new Map()); // Track render tasks per page for cancellation
+    const MAX_CONCURRENT_RENDERS = 1; // Serialize renders for WebView2 stability
 
     // Expose methods to parent
     useImperativeHandle(ref, () => ({
@@ -293,9 +317,7 @@ const PDFViewer = forwardRef(({
                         if (rect.bottom > viewerRect.top + 1) {
                             activePage = i;
 
-                            if (rect.top > viewerRect.top) {
-                                // pagePercent = 0; // Standard calculation below handles this now
-                            } else {
+                            if (rect.top <= viewerRect.top) {
                                 const offset = viewerRect.top - rect.top;
                                 pagePercent = offset / rect.height;
                             }
@@ -337,6 +359,30 @@ const PDFViewer = forwardRef(({
         setZoomInputValue(Math.round(scale * 100).toString());
     }, [scale]);
 
+    // Configure linkService for internal PDF link navigation
+    useEffect(() => {
+        if (pdf?.doc) {
+            linkService.setDocument(pdf.doc);
+            linkService.navigateToPage = (pageNumber) => {
+                if (viewMode === 'continuous' && pageRefs.current[pageNumber]) {
+                    pageRefs.current[pageNumber].scrollIntoView({ behavior: 'auto', block: 'start' });
+                } else if (viewerRef.current) {
+                    viewerRef.current.scrollTop = 0;
+                }
+                setPage(pageNumber);
+            };
+        }
+
+        // Update linkService configuration
+        linkService.isTauri = isTauri;
+        linkService.onLinkHover = (url) => setHoveredLink(url);
+
+        return () => {
+            linkService.navigateToPage = null;
+            linkService.onLinkHover = null;
+        };
+    }, [pdf, viewMode, setPage, viewerRef, isTauri]);
+
     // --- Rendering Logic ---
     const renderPDFPage = async (pdfDoc, pageNum, container, currentScale, taskRef, isPreRender = false, cacheRef = null) => {
         if (!pdfDoc || (!isPreRender && !container) || !pdfjsLib) return false;
@@ -355,6 +401,48 @@ const PDFViewer = forwardRef(({
             const [cvsEl, txt] = cacheRef.current.content;
             if (cvsEl) { cvsEl.style.visibility = ''; cvsEl.style.position = 'relative'; cvsEl.style.zIndex = ''; }
             if (txt) { txt.style.visibility = ''; txt.style.position = 'absolute'; txt.style.zIndex = ''; }
+
+            // Render alt text layer for cached page (cache doesn't store it)
+            try {
+                const pageObj = await pdfDoc.getPage(pageNum);
+                const viewport = pageObj.getViewport({ scale: currentScale });
+                const images = await getPageImages(pageObj, {
+                    fallbackMode: altTextSettings?.fallbackMode || 'spatial'
+                });
+                if (images && images.length > 0) {
+                    const altLayer = document.createElement('div');
+                    altLayer.className = 'altTextLayer';
+                    altLayer.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;z-index:var(--z-annotation-base);';
+
+                    for (const img of images) {
+                        const [x, y, x2, y2] = img.rect;
+                        const [vx, vy, vx2, vy2] = viewport.convertToViewportRectangle([x, y, x2, y2]);
+                        const left = Math.min(vx, vx2);
+                        const top = Math.min(vy, vy2);
+                        const width = Math.abs(vx2 - vx);
+                        const height = Math.abs(vy2 - vy);
+
+                        const overlay = document.createElement('div');
+                        overlay.className = 'image-alt-overlay';
+                        overlay.style.left = `${left}px`;
+                        overlay.style.top = `${top}px`;
+                        overlay.style.width = `${width}px`;
+                        overlay.style.height = `${height}px`;
+                        overlay.title = img.alt;
+
+                        if (altTextSettings?.showIndicator !== false) {
+                            const badge = document.createElement('div');
+                            badge.className = 'alt-badge';
+                            badge.textContent = 'ALT';
+                            overlay.appendChild(badge);
+                        }
+                        altLayer.appendChild(overlay);
+                    }
+                    container.appendChild(altLayer);
+                }
+            } catch (e) {
+                console.warn('Failed to render alt text for cached page:', e);
+            }
 
             cacheRef.current = { page: null, scale: null, content: null };
             return true;
@@ -425,12 +513,12 @@ const PDFViewer = forwardRef(({
             newCanvas.style.position = 'absolute';
             newCanvas.style.top = '0';
             newCanvas.style.left = '0';
-            newCanvas.style.zIndex = '5'; // New on top
+            newCanvas.style.zIndex = 'var(--z-pdf-canvas)'; // New on top
 
             newTextLayer.style.position = 'absolute';
             newTextLayer.style.top = '0';
             newTextLayer.style.left = '0';
-            newTextLayer.style.zIndex = '6';
+            newTextLayer.style.zIndex = 'var(--z-text-layer)';
 
             container.appendChild(newCanvas);
             container.appendChild(newTextLayer);
@@ -450,12 +538,18 @@ const PDFViewer = forwardRef(({
 
             if (taskRef) taskRef.current = null;
 
+            // YIELD: Give Tauri event loop a chance to process after heavy render
+            await new Promise(r => setTimeout(r, 0));
+
             if (pdfjsLib.TextLayer) {
                 await new pdfjsLib.TextLayer({ textContentSource: textContent, container: newTextLayer, viewport }).render();
             } else {
                 const tTask = pdfjsLib.renderTextLayer({ textContent, container: newTextLayer, viewport, textDivs: [] });
                 if (tTask.promise) await tTask.promise;
             }
+
+            // YIELD: Give Tauri event loop a chance after text layer
+            await new Promise(r => setTimeout(r, 0));
 
             // Add endOfContent element to prevent selection flicker (PDF.js approach)
             const endOfContent = document.createElement('div');
@@ -464,6 +558,114 @@ const PDFViewer = forwardRef(({
 
             // Register with selection manager for Chrome-compatible selection handling
             TextLayerSelectionManager.register(newTextLayer, endOfContent);
+
+            // Render annotation layer for internal PDF links
+            let newAnnotationLayer = null;
+            try {
+                const annotations = await pageObj.getAnnotations({ intent: 'display' });
+
+                // Only create annotation layer if there are link annotations
+                const hasLinks = annotations.some(a => a.subtype === 'Link');
+                if (hasLinks && pdfjsLib.AnnotationLayer) {
+                    newAnnotationLayer = document.createElement('div');
+                    newAnnotationLayer.className = 'annotationLayer';
+                    newAnnotationLayer.style.left = '0';
+                    newAnnotationLayer.style.top = '0';
+                    newAnnotationLayer.style.width = '100%';
+                    newAnnotationLayer.style.height = '100%';
+                    newAnnotationLayer.style.position = 'absolute';
+                    newAnnotationLayer.style.visibility = 'hidden';
+
+                    // PDF.js v3.11 uses class instantiation, but linkService is passed to render()
+                    const annotationLayer = new pdfjsLib.AnnotationLayer({
+                        div: newAnnotationLayer,
+                        accessibilityManager: null, // Optional for basic functionality
+                        annotationCanvasMap: null,
+                        l10n: null, // Optional
+                        page: pageObj,
+                        viewport: viewport.clone({ dontFlip: true }),
+                    });
+
+                    await annotationLayer.render({
+                        viewport: viewport.clone({ dontFlip: true }),
+                        div: newAnnotationLayer,
+                        annotations,
+                        page: pageObj,
+                        linkService,
+                        downloadManager, // Required for file attachments/some links
+                        renderForms: false,
+                        imageResourcesPath: '',
+                        annotationStorage: pdfjsLib.AnnotationStorage ? new pdfjsLib.AnnotationStorage() : null,
+                    });
+                }
+            } catch (annotationError) {
+                console.warn('Failed to render annotation layer:', annotationError);
+            }
+
+            // Render Alt Text Layer (DEFERRED - skip if no longer visible to prevent blocking)
+            // Alt text is expensive (getStructTree + getOperatorList), defer to idle time
+            let newAltTextLayer = null;
+            try {
+                // Skip alt text extraction during fast scrolling
+                // The page must still be "wanted" - check if container is still in DOM and visible
+                if (!container.isConnected) {
+                    // Page was scrolled away during render, skip alt text
+                } else {
+                    const images = await getPageImages(pageObj, {
+                        fallbackMode: altTextSettings?.fallbackMode || 'spatial'
+                    });
+                    if (images && images.length > 0) {
+                        newAltTextLayer = document.createElement('div');
+                        newAltTextLayer.className = 'altTextLayer';
+                        newAltTextLayer.style.position = 'absolute';
+                        newAltTextLayer.style.top = '0';
+                        newAltTextLayer.style.left = '0';
+                        newAltTextLayer.style.width = '100%';
+                        newAltTextLayer.style.height = '100%';
+                        newAltTextLayer.style.zIndex = 'var(--z-annotation-base)'; // Use existing z-index var or 25 defined in css
+                        newAltTextLayer.style.visibility = 'hidden';
+
+                        for (const img of images) {
+                            const [x, y, x2, y2] = img.rect;
+                            // Convert PDF coords to viewport coords
+                            // rect is [x, y, x2, y2] in PDF user space
+                            // viewport.convertToViewportRectangle stores [xMin, yMin, xMax, yMax]
+                            const [vx, vy, vx2, vy2] = viewport.convertToViewportRectangle([x, y, x2, y2]);
+
+                            // Calculate CSS values (left, top, width, height)
+                            // PDF coords: Y grows up. Viewport: Y grows down?
+                            // convertToViewportRectangle handles coordinate transformation (flipping Y)
+
+                            // Normalize min/max because rotation/flip might swap order
+                            const left = Math.min(vx, vx2);
+                            const top = Math.min(vy, vy2);
+                            const width = Math.abs(vx2 - vx);
+                            const height = Math.abs(vy2 - vy);
+
+                            const overlay = document.createElement('div');
+                            overlay.className = 'image-alt-overlay';
+                            overlay.style.left = `${left}px`;
+                            overlay.style.top = `${top}px`;
+                            overlay.style.width = `${width}px`;
+                            overlay.style.height = `${height}px`;
+                            overlay.title = img.alt; // Native tooltip
+
+                            // Conditionally show ALT badge based on setting
+                            if (altTextSettings?.showIndicator !== false) {
+                                const badge = document.createElement('div');
+                                badge.className = 'alt-badge';
+                                badge.textContent = 'ALT';
+                                overlay.appendChild(badge);
+                            }
+
+                            newAltTextLayer.appendChild(overlay);
+                        }
+                    }
+                }
+            } catch (altError) {
+                console.warn('Failed to render alt text layer:', altError);
+            }
+
 
             // Atomic swap
             await new Promise(resolve => {
@@ -479,7 +681,21 @@ const PDFViewer = forwardRef(({
                     container.dataset.renderedHeight = newCanvas.style.height;
                     container.dataset.renderedPageNumber = pageNum.toString();
 
-                    container.replaceChildren(newCanvas, newTextLayer);
+                    // Unregister old text layer before replacing (fixes Firefox/Chrome selection flicker)
+                    const oldTextLayer = container.querySelector('.textLayer');
+                    if (oldTextLayer) {
+                        TextLayerSelectionManager.unregister(oldTextLayer);
+                    }
+
+                    if (newAnnotationLayer) {
+                        container.replaceChildren(newCanvas, newTextLayer, newAnnotationLayer);
+                    } else {
+                        container.replaceChildren(newCanvas, newTextLayer);
+                    }
+
+                    if (newAltTextLayer) {
+                        container.appendChild(newAltTextLayer);
+                    }
 
                     newCanvas.style.visibility = '';
                     newCanvas.style.position = 'relative';
@@ -492,6 +708,13 @@ const PDFViewer = forwardRef(({
                     newTextLayer.style.top = '0';
                     newTextLayer.style.left = '0';
                     newTextLayer.style.zIndex = '';
+
+                    if (newAnnotationLayer) {
+                        newAnnotationLayer.style.visibility = '';
+                    }
+                    if (newAltTextLayer) {
+                        newAltTextLayer.style.visibility = '';
+                    }
 
                     resolve();
                 });
@@ -519,7 +742,8 @@ const PDFViewer = forwardRef(({
                 }
             });
         }
-    }, [viewMode, pdf, page, numPages]); // Remove scale - handled by transform effect below
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [viewMode, pdf, page, numPages, altTextSettings]); // Remove scale - handled by transform effect below; altTextSettings for alt layer
 
     // --- Single Mode Transform Zoom ---
     // Exact same logic as continuous mode (lines 406-510) but for single container
@@ -602,6 +826,7 @@ const PDFViewer = forwardRef(({
             zoomDebounceRef.current = null;
         }, 150);
 
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [viewMode, pdf, scale, viewerRef]);
 
     const zoomDebounceRef = useRef(null);
@@ -704,54 +929,160 @@ const PDFViewer = forwardRef(({
 
     }, [viewMode, pdf, numPages, scale, viewerRef]);
 
-    // --- Continuous Mode Rendering ---
-    const renderPageInContinuous = useCallback(async (pageNum) => {
+    // --- Continuous Mode Rendering with Priority Queue ---
+    // Use ref to avoid circular dependency
+    const processRenderQueueRef = useRef(null);
+
+    // Execute actual page render
+    const executePageRender = useCallback(async (pageNum) => {
+        const container = pageRefs.current[pageNum];
+        if (!container || !pdf) {
+            processRenderQueueRef.current?.(); // Move to next
+            return;
+        }
+
+        const needsRerender = container.dataset.targetScale !== undefined;
+        if (container.hasChildNodes() && !needsRerender) {
+            renderingPages.current.delete(pageNum);
+            processRenderQueueRef.current?.(); // Move to next
+            return;
+        }
+
+        renderingPages.current.add(pageNum);
+
+        // Create taskRef and store in global map for cancellation
+        const taskRef = { current: null };
+
+        try {
+            // We need to track when taskRef gets set and store it
+            const renderPromise = renderPDFPage(pdf.doc, pageNum, container, scale, taskRef);
+
+            // Store task reference for cancellation (taskRef.current is set inside renderPDFPage)
+            // Check periodically until it's set or render completes
+            const checkTaskInterval = setInterval(() => {
+                if (taskRef.current) {
+                    renderTasksRef.current.set(pageNum, taskRef.current);
+                    clearInterval(checkTaskInterval);
+                }
+            }, 10);
+
+            const success = await renderPromise;
+            clearInterval(checkTaskInterval);
+            renderTasksRef.current.delete(pageNum);
+
+            if (success) {
+                delete container.dataset.targetScale;
+
+                // Handle scale drift if UI scale changed during render
+                if (scale !== pendingScaleRef.current) {
+                    const rendered = parseFloat(container.dataset.renderedScale);
+                    const ratio = pendingScaleRef.current / rendered;
+
+                    const canvas = container.querySelector('canvas');
+                    const textLayer = container.querySelector('.textLayer');
+                    if (canvas) {
+                        canvas.style.transformOrigin = 'top left';
+                        canvas.style.transform = `scale(${ratio})`;
+                    }
+                    if (textLayer) {
+                        textLayer.style.transformOrigin = 'top left';
+                        textLayer.style.transform = `scale(${ratio})`;
+                    }
+
+                    // Resize container for drift
+                    if (container.dataset.renderedWidth && container.dataset.renderedHeight) {
+                        const originalW = parseFloat(container.dataset.renderedWidth);
+                        const originalH = parseFloat(container.dataset.renderedHeight);
+                        if (!isNaN(originalW)) {
+                            const newW = (originalW * ratio) + 'px';
+                            const newH = (originalH * ratio) + 'px';
+                            container.style.width = newW;
+                            container.style.height = newH;
+                            container.style.minWidth = newW;
+                            container.style.minHeight = newH;
+                        }
+                    }
+                }
+            }
+        } finally {
+            renderingPages.current.delete(pageNum);
+            preRenderingPages.current.delete(pageNum);
+            processRenderQueueRef.current?.(); // Process next based on visibility
+        }
+    }, [pdf, scale]);
+
+    // Get highest priority page to render (PDF.js approach)
+    // Priority: 1) Visible pages, 2) Adjacent to visible
+    const getHighestPriorityPage = useCallback(() => {
+        // First: check visible pages that need rendering
+        for (const pageNum of visiblePages.current) {
+            if (renderingPages.current.has(pageNum)) continue;
+
+            const container = pageRefs.current[pageNum];
+            if (!container) continue;
+
+            const needsRerender = container.dataset.targetScale !== undefined;
+            if (!container.hasChildNodes() || needsRerender) {
+                return pageNum;
+            }
+        }
+
+        // Second: check queue items that are still in/near visible area
+        for (let i = 0; i < renderQueue.current.length; i++) {
+            const pageNum = renderQueue.current[i];
+            if (renderingPages.current.has(pageNum)) continue;
+
+            // Only process if page is visible or adjacent to visible
+            const isNearVisible = visiblePages.current.has(pageNum) ||
+                visiblePages.current.has(pageNum - 1) ||
+                visiblePages.current.has(pageNum + 1);
+
+            if (isNearVisible) {
+                renderQueue.current.splice(i, 1); // Remove from queue
+                return pageNum;
+            }
+        }
+
+        // Clear stale queue items (pages that scrolled out of view)
+        renderQueue.current = renderQueue.current.filter(p =>
+            visiblePages.current.has(p) ||
+            visiblePages.current.has(p - 1) ||
+            visiblePages.current.has(p + 1)
+        );
+
+        return null;
+    }, []);
+
+    // Process next highest priority page
+    const processRenderQueue = useCallback(() => {
+        if (renderingPages.current.size >= MAX_CONCURRENT_RENDERS) return;
+
+        const nextPage = getHighestPriorityPage();
+        if (nextPage !== null) {
+            executePageRender(nextPage);
+        }
+    }, [executePageRender, getHighestPriorityPage]);
+
+    // Keep ref updated
+    processRenderQueueRef.current = processRenderQueue;
+
+    // Public function to request a page render
+    const renderPageInContinuous = useCallback((pageNum) => {
+        // Skip if already rendering
+        if (renderingPages.current.has(pageNum)) return;
+
         const container = pageRefs.current[pageNum];
         if (!container || !pdf) return;
 
         const needsRerender = container.dataset.targetScale !== undefined;
         if (container.hasChildNodes() && !needsRerender) return;
 
-        const taskRef = { current: null };
-        const success = await renderPDFPage(pdf.doc, pageNum, container, scale, taskRef);
-
-        if (success) {
-            delete container.dataset.targetScale;
-
-            // Handle scale drift if UI scale changed during render
-            if (scale !== pendingScaleRef.current) {
-                const rendered = parseFloat(container.dataset.renderedScale);
-                const ratio = pendingScaleRef.current / rendered;
-
-                const canvas = container.querySelector('canvas');
-                const textLayer = container.querySelector('.textLayer');
-                if (canvas) {
-                    canvas.style.transformOrigin = 'top left';
-                    canvas.style.transform = `scale(${ratio})`;
-                }
-                if (textLayer) {
-                    textLayer.style.transformOrigin = 'top left';
-                    textLayer.style.transform = `scale(${ratio})`;
-                }
-
-                // Resize container for drift
-                if (container.dataset.renderedWidth && container.dataset.renderedHeight) {
-                    const originalW = parseFloat(container.dataset.renderedWidth);
-                    const originalH = parseFloat(container.dataset.renderedHeight);
-                    if (!isNaN(originalW)) {
-                        const newW = (originalW * ratio) + 'px';
-                        const newH = (originalH * ratio) + 'px';
-                        container.style.width = newW;
-                        container.style.height = newH;
-                        container.style.minWidth = newW;
-                        container.style.minHeight = newH;
-                    }
-                }
-            }
+        // Add to queue (deduped) and trigger processing
+        if (!renderQueue.current.includes(pageNum)) {
+            renderQueue.current.push(pageNum);
         }
-
-        preRenderingPages.current.delete(pageNum);
-    }, [pdf, scale]);
+        processRenderQueue();
+    }, [pdf, processRenderQueue]);
 
     // Pre-render nearby pages during idle time
     const schedulePreRender = useCallback((centerPage) => {
@@ -812,9 +1143,18 @@ const PDFViewer = forwardRef(({
                 if (entry.isIntersecting) {
                     visiblePages.current.add(pageNum);
                     renderPageInContinuous(pageNum);
-                    schedulePreRender(pageNum);
+                    // Only pre-render during idle (not every intersection)
                 } else {
                     visiblePages.current.delete(pageNum);
+
+                    // CRITICAL: Cancel any in-progress render for this page
+                    const renderTask = renderTasksRef.current.get(pageNum);
+                    if (renderTask) {
+                        renderTask.cancel();
+                        renderTasksRef.current.delete(pageNum);
+                        renderingPages.current.delete(pageNum);
+                    }
+
                     // Clear off-screen pages (memory optimization)
                     const container = entry.target;
                     if (container && container.hasChildNodes()) {
@@ -828,7 +1168,7 @@ const PDFViewer = forwardRef(({
             });
         }, {
             root: viewerRef.current,
-            rootMargin: '200% 0px 200% 0px',
+            rootMargin: '50% 0px 50% 0px', // Reduced from 200% for better fast-scroll performance
             threshold: 0
         });
 
@@ -854,6 +1194,7 @@ const PDFViewer = forwardRef(({
                 }
             });
         }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [viewMode, pdf]); // Trigger when viewMode changes to continuous
 
     // --- Continuous Scroll Handler ---
@@ -919,22 +1260,37 @@ const PDFViewer = forwardRef(({
     const scrollToPage = (targetPage) => {
         if (viewMode === 'continuous' && pageRefs.current[targetPage]) {
             pageRefs.current[targetPage].scrollIntoView({ behavior: 'auto', block: 'start' });
-        } else {
-            setPage(targetPage);
+        } else if (viewerRef.current) {
+            // In single page mode, scroll to top of page
+            viewerRef.current.scrollTop = 0;
         }
+        setPage(targetPage);
     };
 
     const handleZoomInputBlur = () => {
-        const val = parseInt(zoomInputValue);
-        if (isNaN(val) || val < 50 || val > 300) {
+        const val = parseInt(zoomInputValue, 10);
+        if (isNaN(val)) {
             setZoomInputValue(Math.round(scale * 100).toString());
         } else {
-            setScale(val / 100);
+            // Clamp between 20% and 300%
+            const clamped = Math.max(20, Math.min(val, 300));
+            if (clamped !== val) {
+                setZoomInputValue(clamped.toString());
+            }
+            setScale(clamped / 100);
         }
     };
 
     const handleZoomInputKeyDown = (e) => {
         if (e.key === 'Enter') {
+            const val = parseInt(zoomInputValue, 10);
+            if (!isNaN(val)) {
+                const clamped = Math.max(20, Math.min(val, 300));
+                if (clamped !== val) {
+                    setZoomInputValue(clamped.toString());
+                }
+                setScale(clamped / 100);
+            }
             e.currentTarget.blur();
         } else if (e.key === 'Escape') {
             setZoomInputValue(Math.round(scale * 100).toString());
@@ -948,6 +1304,7 @@ const PDFViewer = forwardRef(({
             setPageInputValue(page.toString());
         } else {
             if (viewMode === 'continuous') scrollToPage(val);
+            else if (viewerRef.current) viewerRef.current.scrollTop = 0;
             setPage(val);
         }
     };
@@ -968,9 +1325,6 @@ const PDFViewer = forwardRef(({
             const viewport = pageObj.getViewport({ scale: 1.0 });
 
             const viewer = viewerRef.current;
-            const style = window.getComputedStyle(viewer);
-            const borderX = parseFloat(style.borderLeftWidth || 0) + parseFloat(style.borderRightWidth || 0);
-            const borderY = parseFloat(style.borderTopWidth || 0) + parseFloat(style.borderBottomWidth || 0);
 
             // Buffer: 4px for safety
             const buffer = 4;
@@ -1201,80 +1555,7 @@ const PDFViewer = forwardRef(({
 
 
 
-    // Lazy coordinate fetching - only called when navigating to a result
-    const getResultRect = async (pageNum, query, posInText) => {
-        if (!pdf) return null;
-        try {
-            const pageObj = await pdf.doc.getPage(pageNum);
-            const content = await pageObj.getTextContent({ normalizeWhitespace: true });
-            const viewport = pageObj.getViewport({ scale: 1.0 });
 
-            // Rebuild text and mapping for this page using EXACT SAME logic as extractAllText
-            let text = "";
-            let itemIndexAtPos = -1;
-            let offsetInItem = -1;
-            let charIndex = 0;
-            let lastItem = null;
-
-            for (let i = 0; i < content.items.length; i++) {
-                const item = content.items[i];
-                if (!item.str && item.str.length === 0) continue;
-
-                if (lastItem) {
-                    const isSameLine = Math.abs(item.transform[5] - lastItem.transform[5]) < (item.height || 10) * 0.5;
-                    const gap = item.transform[4] - (lastItem.transform[4] + lastItem.width);
-
-                    const significantGap = gap > (item.height || 10) * 0.12;
-                    const alreadyHasSpace = lastItem.str.endsWith(' ') || item.str.startsWith(' ');
-
-                    if (!isSameLine || (significantGap && !alreadyHasSpace)) {
-                        if (charIndex === posInText) {
-                            // Match starts on the space we inserted!
-                            // We'll jump to the next character's item
-                            itemIndexAtPos = i;
-                            offsetInItem = 0;
-                        }
-                        charIndex++;
-                        text += " ";
-                    }
-                }
-
-                if (posInText >= charIndex && posInText < charIndex + item.str.length) {
-                    itemIndexAtPos = i;
-                    offsetInItem = posInText - charIndex;
-                }
-
-                charIndex += item.str.length;
-                text += item.str;
-                lastItem = item;
-
-                if (itemIndexAtPos !== -1) {
-                    const matchedItem = content.items[itemIndexAtPos];
-                    const x = matchedItem.transform[4];
-                    const y = matchedItem.transform[5];
-                    const h = matchedItem.height || Math.abs(matchedItem.transform[0]) || Math.abs(matchedItem.transform[3]) || 10;
-                    const w = matchedItem.width;
-
-                    const queryLen = Math.min(query.length, matchedItem.str.length - offsetInItem);
-
-                    // Linear estimation of character positions
-                    const subXOffset = (offsetInItem / matchedItem.str.length) * w;
-                    const subWidth = (queryLen / matchedItem.str.length) * w;
-
-                    return {
-                        left: ((x + subXOffset) / viewport.width) * 100,
-                        top: ((viewport.height - (y + h)) / viewport.height) * 100,
-                        width: (subWidth / viewport.width) * 100,
-                        height: (h / viewport.height) * 100
-                    };
-                }
-            }
-            return null;
-        } catch (err) {
-            console.error("Failed to get result coordinates", err);
-            return null;
-        }
-    };
 
     const performSearch = async (query, isNext = false) => {
         if (!query.trim()) {
@@ -1426,7 +1707,7 @@ const PDFViewer = forwardRef(({
 
     const navigateToResult = async (result, query, pageData = null) => {
         // Set navigation guard - increment version counter to cancel any in-flight attempts
-        const navVersion = ++activeNavigationRef.current;
+        ++activeNavigationRef.current;
 
         // Clear previous highlights only on the target page's container
         let prevContainer = viewMode === 'continuous'
@@ -1780,21 +2061,13 @@ const PDFViewer = forwardRef(({
             });
         };
 
-        // Start the highlight attempt after initial delay
-        // Single page mode needs more time for page render after setPage
         // Start the highlight attempt fast!
         // Single page mode might need a moment for React/DOM to settle, but we want to catch it ASAP.
         // We'll use a fast initial poll.
         setTimeout(() => attemptHighlight(0), 10);
     };
 
-    const handleSearchKeyDown = (e) => {
-        if (e.key === 'Enter') {
-            performSearch(searchQuery, true);
-        } else if (e.key === 'Escape') {
-            setShowSearch(false);
-        }
-    };
+
 
     useEffect(() => {
         if (showSearch && searchInputRef.current) {
@@ -1890,45 +2163,35 @@ const PDFViewer = forwardRef(({
             data-pdf-viewer="true"
             data-side={side}
         >
+            {/* Link Preview Overlay */}
+            {hoveredLink && (
+                <div className="fixed bottom-0 left-0 m-0 z-[200] bg-gray-100 border-t border-r border-gray-300 px-2 py-1 text-xs text-gray-700 font-mono shadow-sm pointer-events-none max-w-[500px] truncate">
+                    {hoveredLink}
+                </div>
+            )}
+
+            {/* ===== TOOLBAR START ===== */}
             <div className="bg-gray-100 px-0 py-0 border-b border-gray-300">
                 <div className="flex items-center w-full min-h-[22px] h-auto flex-wrap relative">
-                    {/* Left section: Filename + Search + Prev + Input */}
+                    {/* Left section: Filename + Search + Page Input */}
                     <div className="flex-1 flex items-center min-w-0">
                         <div className="flex items-center px-2 min-w-0 flex-shrink">
-                            {pdf ? (
-                                pdf.sourceUrl ? (
-                                    <a
-                                        href={pdf.sourceUrl}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="text-xs font-medium text-gray-700 hover:underline truncate cursor-pointer active:opacity-70"
-                                        title={pdf.sourceUrl.startsWith('file:///') ? "Copy path" : "Open outside"}
-                                        onClick={(e) => {
-                                            if (pdf.sourceUrl.startsWith('file:///')) {
-                                                e.preventDefault();
-                                                const cleanPath = pdf.sourceUrl.replace('file:///', '');
-                                                navigator.clipboard.writeText(cleanPath);
-                                                setCopyFeedback("Path Copied!");
-                                                setTimeout(() => setCopyFeedback(null), 2000);
-                                            }
-                                        }}
-                                    >
-                                        {copyFeedback || pdf.name}
-                                    </a>
-                                ) : (
-                                    <span className="text-xs font-medium text-gray-700 truncate" title={pdf.name}>
-                                        {pdf.name}
-                                    </span>
-                                )
-                            ) : (
-                                <span className="text-xs font-medium text-gray-400 truncate" title={`${side === 'left' ? 'Left' : 'Right'} PDF`}>
-                                    {`${side === 'left' ? 'Left' : 'Right'} PDF`}
-                                </span>
-                            )}
+                            <FileInfo
+                                pdf={pdf}
+                                side={side}
+                                copyFeedback={copyFeedback}
+                                onCopyPath={(url) => {
+                                    const cleanPath = url.replace('file:///', '');
+                                    navigator.clipboard.writeText(cleanPath);
+                                    setCopyFeedback("Path Copied!");
+                                    setTimeout(() => setCopyFeedback(null), 2000);
+                                }}
+                            />
                         </div>
 
                         {pdf && (
                             <div className="flex items-center ml-auto">
+                                {/* Search toggle */}
                                 <button
                                     onClick={() => setShowSearch(!showSearch)}
                                     className={`h-[22px] w-[24px] flex items-center justify-center p-0 rounded-none transition-colors ${showSearch ? 'bg-blue-500 text-white' : 'bg-transparent hover:bg-gray-200'}`}
@@ -1940,15 +2203,18 @@ const PDFViewer = forwardRef(({
                                 <div className="w-6 h-[22px] flex items-center justify-center">
                                     <div className="w-px h-3.5 bg-gray-300" />
                                 </div>
+
+                                {/* Page navigation (left part: prev + input) */}
                                 <button
                                     onClick={() => {
                                         const prev = Math.max(1, page - 1);
                                         if (viewMode === 'continuous') scrollToPage(prev);
+                                        else if (viewerRef.current) viewerRef.current.scrollTop = 0;
                                         setPage(prev);
                                     }}
                                     disabled={page <= 1}
                                     className="h-[22px] w-[24px] flex items-center justify-center p-0 bg-transparent rounded-none hover:bg-gray-200 disabled:opacity-50"
-                                    title="Previous page"
+                                    title="Previous page (Alt+←)"
                                 >
                                     <ChevronLeft className="w-4 h-4" />
                                 </button>
@@ -1967,14 +2233,14 @@ const PDFViewer = forwardRef(({
                         )}
                     </div>
 
-                    {/* The absolute center: The slash */}
+                    {/* Center: Slash divider */}
                     {pdf && (
                         <div className="flex-none flex items-center">
                             <span className="text-xs text-gray-500 px-0.5">/</span>
                         </div>
                     )}
 
-                    {/* Right section: TotalPages + Next + Zoom + Utilities */}
+                    {/* Right section: Total + Next + Zoom + Utilities */}
                     <div className="flex-1 flex items-center">
                         {pdf && (
                             <div className="flex items-center">
@@ -1983,11 +2249,12 @@ const PDFViewer = forwardRef(({
                                     onClick={() => {
                                         const next = Math.min(numPages, page + 1);
                                         if (viewMode === 'continuous') scrollToPage(next);
+                                        else if (viewerRef.current) viewerRef.current.scrollTop = 0;
                                         setPage(next);
                                     }}
                                     disabled={page >= numPages}
                                     className="h-[22px] w-[24px] flex items-center justify-center p-0 bg-transparent rounded-none hover:bg-gray-200 disabled:opacity-50"
-                                    title="Next page"
+                                    title="Next page (Alt+→)"
                                 >
                                     <ChevronRight className="w-4 h-4" />
                                 </button>
@@ -1996,55 +2263,41 @@ const PDFViewer = forwardRef(({
                                     <div className="w-px h-3.5 bg-gray-300" />
                                 </div>
 
-                                <button
-                                    onClick={() => setScale(Math.max(0.5, scale - 0.25))}
-                                    className="h-[22px] w-[24px] flex items-center justify-center p-0 bg-transparent rounded-none hover:bg-gray-200"
-                                    title="Zoom out"
-                                >
-                                    <ZoomOut className="w-4 h-4" />
-                                </button>
-                                <div className="flex items-center gap-0.5 mx-0">
-                                    <input
-                                        type="text"
-                                        value={zoomInputValue}
-                                        onChange={(e) => setZoomInputValue(e.target.value)}
-                                        onBlur={handleZoomInputBlur}
-                                        onKeyDown={handleZoomInputKeyDown}
-                                        className="w-8 text-center text-xs bg-gray-200/50 border-none rounded-none p-0 h-[22px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-                                    />
-                                    <span className="text-xs text-gray-500 font-medium">%</span>
-                                </div>
-                                <button
-                                    onClick={() => setScale(Math.min(3, scale + 0.25))}
-                                    className="h-[22px] w-[24px] flex items-center justify-center p-0 bg-transparent rounded-none hover:bg-gray-200"
-                                    title="Zoom in"
-                                >
-                                    <ZoomIn className="w-4 h-4" />
-                                </button>
-
-                                <div className="w-6 h-[22px] flex items-center justify-center">
-                                    <div className="w-px h-3.5 bg-gray-300" />
-                                </div>
-
-                                <button
-                                    onClick={() => handleFitToPage(false)}
-                                    className="h-[22px] w-[24px] flex items-center justify-center p-0 bg-transparent rounded-none hover:bg-gray-200 text-gray-500 hover:text-blue-600"
-                                    title="Fit to page"
-                                >
-                                    <Maximize2 className="w-4 h-4" />
-                                </button>
-                                <button
-                                    onClick={() => setScale(1.0)}
-                                    className="h-[22px] w-[24px] flex items-center justify-center p-0 bg-transparent rounded-none hover:bg-gray-200 text-gray-500 hover:text-blue-600"
-                                    title="Reset zoom to 100%"
-                                >
-                                    <RotateCcw className="w-4 h-4" />
-                                </button>
+                                <ZoomControls
+                                    scale={scale}
+                                    setScale={setScale}
+                                    zoomInputValue={zoomInputValue}
+                                    setZoomInputValue={setZoomInputValue}
+                                    onZoomBlur={handleZoomInputBlur}
+                                    onZoomKeyDown={handleZoomInputKeyDown}
+                                    onFitToPage={handleFitToPage}
+                                />
                             </div>
                         )}
 
                         <div className="flex items-center gap-0 ml-auto">
-                            {/* Settings - always visible */}
+                            {/* Panels dropdown */}
+                            {pdf && (
+                                <div className="relative">
+                                    <button
+                                        onClick={() => setShowPanelsMenu(!showPanelsMenu)}
+                                        className={`h-[22px] w-[24px] flex items-center justify-center p-0 rounded-none transition-colors ${showPanelsMenu || showBookmarks || showAnnotations ? 'bg-blue-500 text-white' : 'bg-transparent text-gray-600 hover:bg-gray-200'}`}
+                                        title="Toggle panels"
+                                    >
+                                        <PanelLeft className="w-4 h-4" />
+                                    </button>
+                                    <PanelsMenu
+                                        show={showPanelsMenu}
+                                        onClose={() => setShowPanelsMenu(false)}
+                                        showBookmarks={showBookmarks}
+                                        setShowBookmarks={setShowBookmarks}
+                                        showAnnotations={showAnnotations}
+                                        setShowAnnotations={setShowAnnotations}
+                                    />
+                                </div>
+                            )}
+
+                            {/* Settings - left panel only */}
                             {side === 'left' && (
                                 <div className="relative">
                                     <button
@@ -2057,203 +2310,97 @@ const PDFViewer = forwardRef(({
                                     >
                                         <Settings className="w-4 h-4" />
                                     </button>
-
-                                    {showSettings && (
-                                        <>
-                                            <div
-                                                className="fixed inset-0 z-[105]"
-                                                onClick={() => setShowSettings(false)}
-                                            />
-                                            <div
-                                                className="absolute top-full right-0 bg-white border border-gray-300 rounded-none z-[110] min-w-[180px] animate-in fade-in slide-in-from-top-1 duration-200"
-                                                style={{ boxShadow: '0 4px 20px rgba(0, 0, 0, 0.15)' }}
-                                            >
-                                                {setViewMode && (
-                                                    <div className="p-1.5">
-                                                        <div className="text-[10px] text-gray-400 mb-2 font-bold uppercase tracking-tight">View</div>
-                                                        <div className="flex border border-gray-200 bg-gray-50 p-0">
-                                                            <button
-                                                                onClick={() => setViewMode('single')}
-                                                                className={`flex-1 text-[10px] py-1.5 transition-colors ${viewMode === 'single' ? 'bg-gray-800 text-white font-bold' : 'text-gray-500 hover:bg-gray-200'}`}
-                                                                title="See one page at a time (recommended)"
-                                                            >
-                                                                PAGE
-                                                            </button>
-                                                            <button
-                                                                onClick={() => setViewMode('continuous')}
-                                                                className={`flex-1 text-[10px] py-1.5 transition-colors ${viewMode === 'continuous' ? 'bg-gray-800 text-white font-bold' : 'text-gray-500 hover:bg-gray-200'}`}
-                                                                title="Load all pages to scroll through them"
-                                                            >
-                                                                FULL
-                                                            </button>
-                                                        </div>
-                                                    </div>
-                                                )}
-
-                                                <div className="p-1.5">
-                                                    <div className="text-[10px] text-gray-400 mb-2 font-bold uppercase tracking-tight">Annotator</div>
-                                                    <input
-                                                        type="text"
-                                                        placeholder="Enter name..."
-                                                        value={tempAuthorName}
-                                                        onChange={(e) => setTempAuthorName(e.target.value)}
-                                                        onKeyDown={(e) => {
-                                                            if (e.key === 'Enter') {
-                                                                setAuthorName(tempAuthorName);
-                                                                setShowSettings(false);
-                                                            } else if (e.key === 'Escape') {
-                                                                setShowSettings(false);
-                                                            }
-                                                        }}
-                                                        className="w-full text-xs border border-gray-200 rounded-none px-2 py-1.5 focus:outline-none focus:border-gray-400 font-normal bg-gray-50"
-                                                    />
-                                                </div>
-
-                                                <div className="px-1.5 py-2 mt-1">
-                                                    <div className="text-[9px] text-gray-400 font-normal">
-                                                        <a
-                                                            href="https://github.com/PlusKitty/PDFTwice"
-                                                            target="_blank"
-                                                            rel="noopener noreferrer"
-                                                            className="hover:text-gray-600 transition-colors inline-flex items-center gap-1"
-                                                            title="View Source on GitHub"
-                                                        >
-                                                            © 2025 PlusKitty
-                                                            <Github className="w-3 h-3" />
-                                                        </a>
-                                                        {' '}based on{' '}
-                                                        <a
-                                                            href="https://mozilla.github.io/pdf.js/"
-                                                            target="_blank"
-                                                            rel="noopener noreferrer"
-                                                            className="hover:underline hover:text-gray-600 transition-colors"
-                                                        >
-                                                            PDF.js
-                                                        </a>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        </>
-                                    )}
+                                    <SettingsMenu
+                                        show={showSettings}
+                                        onClose={() => setShowSettings(false)}
+                                        viewMode={viewMode}
+                                        setViewMode={setViewMode}
+                                        authorName={authorName}
+                                        tempAuthorName={tempAuthorName}
+                                        setTempAuthorName={setTempAuthorName}
+                                        onSaveAuthor={setAuthorName}
+                                        exportSettings={exportSettings}
+                                        setExportSettings={setExportSettings}
+                                        isTauri={isTauri}
+                                        onLinkHover={setHoveredLink}
+                                        scaleMode={scaleMode}
+                                        setScaleMode={setScaleMode}
+                                        defaultScaleLevel={defaultScaleLevel}
+                                        setDefaultScaleLevel={setDefaultScaleLevel}
+                                        altTextSettings={altTextSettings}
+                                        setAltTextSettings={setAltTextSettings}
+                                    />
                                 </div>
                             )}
 
-                            {/* PDF-dependent controls */}
+                            {/* Utility buttons */}
                             {pdf && (
-                                <>
-                                    {side === 'left' && setSyncScroll && (
-                                        <button
-                                            onClick={() => setSyncScroll(!syncScroll)}
-                                            className={`h-[22px] w-[24px] flex items-center justify-center p-0 rounded-none transition-colors ${syncScroll
-                                                ? 'bg-green-500 text-white hover:bg-green-600'
-                                                : 'bg-transparent text-gray-600 hover:bg-gray-200'
-                                                }`}
-                                            title={syncScroll ? "Sync view (on)" : "Sync view (off)"}
-                                        >
-                                            {syncScroll ? <Lock className="w-4 h-4" /> : <Unlock className="w-4 h-4" />}
-                                        </button>
-                                    )}
-
-                                    {hasComments && (
-                                        <button
-                                            onClick={onExport}
-                                            className="h-[22px] w-[24px] flex items-center justify-center p-0 rounded-none bg-purple-500 text-white hover:bg-purple-600 transition-colors relative"
-                                            title={`Export with comments${isDirty ? ' (Unsaved manual changes)' : ''}`}
-                                        >
-                                            <Download className="w-4 h-4" />
-                                            {isDirty && (
-                                                <div className="absolute -top-1 -right-1 bg-yellow-400 text-black rounded-full border border-[0.5px] border-white p-[1px]" title="Unsaved manual changes">
-                                                    <AlertTriangle className="w-2 h-2" />
-                                                </div>
-                                            )}
-                                        </button>
-                                    )}
-
-                                    <button
-                                        onClick={onClose}
-                                        className="h-[22px] w-[24px] flex items-center justify-center p-0 hover:bg-red-100 rounded-none text-gray-400 hover:text-red-500 transition-colors"
-                                        title="Close"
-                                    >
-                                        <X className="w-4 h-4" />
-                                    </button>
-                                </>
+                                <UtilityButtons
+                                    side={side}
+                                    syncScroll={syncScroll}
+                                    setSyncScroll={setSyncScroll}
+                                    hasComments={hasComments}
+                                    hasBookmarks={hasBookmarksProp}
+                                    isDirty={isDirty}
+                                    onExport={onExport}
+                                    onClose={onClose}
+                                />
                             )}
                         </div>
                     </div>
                 </div>
             </div>
+            {/* ===== TOOLBAR END ===== */}
 
-            {
-                showSearch && (
-                    <div className="bg-white border border-gray-300 px-2 py-1.5 relative z-10">
-                        <div className="flex items-center gap-1.5">
-                            <div className="relative flex-1">
-                                <input
-                                    ref={searchInputRef}
-                                    type="text"
-                                    placeholder="Find..."
-                                    value={searchQuery}
-                                    onChange={(e) => {
-                                        const newQuery = e.target.value;
-                                        setSearchQuery(newQuery);
-                                        performSearch(newQuery, false);
-                                    }}
-                                    onKeyDown={handleSearchKeyDown}
-                                    className="w-full text-xs border-0 rounded-none px-2 py-1 focus:outline-none pr-16 bg-white"
-                                />
-                                <div className="absolute right-2 top-1 flex items-center gap-1">
-                                    {isSearching ? (
-                                        <Loader2 className="w-3 h-3 animate-spin text-gray-600" />
-                                    ) : (
-                                        <span className="text-[10px] text-gray-400 font-medium whitespace-nowrap">
-                                            {searchResults.length > 0 ? `${currentResultIndex + 1} / ${searchResults.length}` : (searchQuery && !isSearching ? 'No results' : '')}
-                                        </span>
-                                    )}
-                                </div>
-                            </div>
-                            <button
-                                onClick={() => setShowSearch(false)}
-                                className="h-[22px] w-[22px] flex items-center justify-center hover:bg-gray-200 rounded-none text-gray-400 hover:text-gray-600 transition-colors"
-                                title="Close search"
-                            >
-                                <X className="w-3.5 h-3.5" />
-                            </button>
-                        </div>
-
-                        {searchResults.length > 0 && (
-                            <div className="max-h-[200px] overflow-y-auto border border-gray-200 bg-white mt-1.5" style={{ overflowAnchor: 'auto' }}>
-                                {searchResults.map((result, idx) => (
-                                    <button
-                                        key={`${result.page}-${result.pos}`}
-                                        ref={el => searchResultRefs.current[idx] = el}
-                                        onClick={() => {
-                                            userNavigatedRef.current = true; // Mark as explicit navigation
-                                            setCurrentResultIndex(idx);
-                                            selectedResultIdRef.current = { page: result.page, pos: result.pos };
-                                            const pageData = extractedText?.pages?.find(p => p.pageNum === result.page);
-                                            navigateToResult(result, result.query, pageData);
-                                        }}
-                                        className={`w-full text-left px-2 py-1.5 border-b border-gray-100 flex justify-between items-start gap-2 transition-colors ${(selectedResultIdRef.current?.page === result.page && selectedResultIdRef.current?.pos === result.pos) ? 'bg-blue-50 border-l-2 border-l-blue-500' : 'hover:bg-gray-50'
-                                            }`}
-                                    >
-                                        <span className="text-[11px] leading-relaxed flex-1 text-gray-600">
-                                            {result.snippet.substring(0, result.queryStart)}
-                                            <b className="text-blue-700 bg-blue-100/50 px-0.5">{result.snippet.substring(result.queryStart, result.queryEnd)}</b>
-                                            {result.snippet.substring(result.queryEnd)}
-                                        </span>
-                                        <span className="text-[10px] font-bold text-gray-400">{result.page}</span>
-                                    </button>
-                                ))}
-                            </div>
-                        )}
-                    </div>
-                )
-            }
+            <SearchPanel
+                show={showSearch}
+                query={searchQuery}
+                setQuery={setSearchQuery}
+                results={searchResults}
+                currentIndex={currentResultIndex}
+                isSearching={isSearching}
+                extractedText={extractedText}
+                onSearch={performSearch}
+                onNavigate={(dir) => {
+                    if (dir === 'next') {
+                        const nextIdx = (currentResultIndex + 1) % searchResults.length;
+                        userNavigatedRef.current = true;
+                        setCurrentResultIndex(nextIdx);
+                        const result = searchResultsRef.current[nextIdx];
+                        if (result) {
+                            selectedResultIdRef.current = { page: result.page, pos: result.pos };
+                            const pageData = extractedText?.pages?.find(p => p.pageNum === result.page);
+                            navigateToResult(result, result.query, pageData);
+                        }
+                    } else {
+                        const prevIdx = currentResultIndex === 0 ? searchResults.length - 1 : currentResultIndex - 1;
+                        userNavigatedRef.current = true;
+                        setCurrentResultIndex(prevIdx);
+                        const result = searchResultsRef.current[prevIdx];
+                        if (result) {
+                            selectedResultIdRef.current = { page: result.page, pos: result.pos };
+                            const pageData = extractedText?.pages?.find(p => p.pageNum === result.page);
+                            navigateToResult(result, result.query, pageData);
+                        }
+                    }
+                }}
+                onClose={() => setShowSearch(false)}
+                onResultClick={(result, idx) => {
+                    userNavigatedRef.current = true;
+                    setCurrentResultIndex(idx);
+                    selectedResultIdRef.current = { page: result.page, pos: result.pos };
+                    const pageData = extractedText?.pages?.find(p => p.pageNum === result.page);
+                    navigateToResult(result, result.query, pageData);
+                }}
+            />
 
             {
                 !pdf ? (
-                    <div
-                        className={`flex-1 flex flex-col items-center justify-center transition-all ${isDragging ? 'bg-blue-50 border-4 border-dashed border-blue-400 rounded-lg m-4' : ''}`}
+                    <UploadZone
+                        onUpload={onUpload}
+                        onLoadFromUrl={onLoadFromUrl}
+                        isLoading={isLoading}
+                        isDragging={isDragging}
                         onDragOver={(e) => {
                             e.preventDefault();
                             setIsDragging(true);
@@ -2267,334 +2414,400 @@ const PDFViewer = forwardRef(({
                                 onUpload({ target: { files: [file] } });
                             }
                         }}
-                    >
-                        <>
-                            <label className={`cursor-pointer flex flex-col items-center gap-3 p-8 border-2 border-dashed rounded-none transition-colors ${isLoading ? 'border-gray-200 bg-gray-50 cursor-wait' : 'border-gray-400 hover:border-blue-500 hover:bg-blue-50'}`}>
-                                <Upload className={`w-12 h-12 ${isLoading ? 'text-gray-300' : 'text-gray-400'}`} />
-                                <span className={`font-medium ${isLoading ? 'text-gray-400' : 'text-gray-600'}`}>{isLoading ? 'Uploading PDF...' : 'Upload PDF'}</span>
-                                <input
-                                    type="file"
-                                    accept="application/pdf"
-                                    onChange={onUpload}
-                                    className="hidden"
-                                    disabled={isLoading}
-                                />
-                            </label>
-
-                            {(() => {
-                                const allowRemote = import.meta.env.VITE_ENABLE_REMOTE_PDFS !== 'false';
-                                const allowLocal = import.meta.env.VITE_ENABLE_LOCAL_BRIDGE !== 'false';
-
-                                if (!allowRemote && !allowLocal) return null;
-
-                                let placeholder = "";
-                                if (allowRemote && allowLocal) placeholder = "https://... or folder/file.pdf";
-                                else if (allowRemote) placeholder = "https://...";
-                                else if (allowLocal) placeholder = "folder/file.pdf";
-
-                                return (
-                                    <>
-                                        <div className="flex items-center w-full max-w-xs gap-3 my-4">
-                                            <div className="h-px bg-gray-300 flex-1"></div>
-                                            <span className="text-gray-400 text-[10px] font-bold uppercase tracking-wider">Or load from URL</span>
-                                            <div className="h-px bg-gray-300 flex-1"></div>
-                                        </div>
-
-                                        <form
-                                            onSubmit={(e) => {
-                                                e.preventDefault();
-                                                const url = e.target.elements.url.value.trim();
-                                                if (url) onLoadFromUrl(url);
-                                            }}
-                                            className="flex w-full max-w-xs gap-2"
-                                        >
-                                            <input
-                                                name="url"
-                                                type="text"
-                                                placeholder={placeholder}
-                                                disabled={isLoading}
-                                                className="flex-1 text-xs border border-gray-300 rounded-none px-2 py-2 focus:outline-none focus:ring-1 focus:ring-blue-500 shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-                                            />
-                                            <button
-                                                type="submit"
-                                                disabled={isLoading}
-                                                className="bg-gray-900 text-white text-xs font-medium px-4 py-2 rounded-none hover:bg-gray-800 transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-                                            >
-                                                {isLoading && <Loader2 className="w-3 h-3 animate-spin" />}
-                                                {isLoading ? 'Loading...' : 'Load'}
-                                            </button>
-                                        </form>
-                                    </>
-                                );
-                            })()}
-                        </>
-                    </div>
+                    />
                 ) : (
-                    <div
-                        ref={viewerRef}
-                        tabIndex={0}
-                        className={`flex-1 overflow-auto relative bg-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-400/20 ${viewMode === 'single' ? 'p-0 flex' : 'py-4 px-0 flex flex-col items-center'}`}
-                        onScroll={handleScrollInternal}
-                        onMouseUp={handleMouseUp}
-                        onKeyDown={(e) => {
-                            if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
-                            if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-                                e.preventDefault();
-                                const prev = Math.max(1, page - 1);
-                                if (viewMode === 'continuous') scrollToPage(prev);
-                                setPage(prev);
-                            } else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-                                e.preventDefault();
-                                const next = Math.min(numPages, page + 1);
-                                if (viewMode === 'continuous') scrollToPage(next);
-                                setPage(next);
-                            }
-                        }}
-                    >
-                        {viewMode === 'single' ? (
-                            <div
-                                data-page={page}
-                                className="pdf-page-container relative block m-auto bg-white shadow-lg w-fit"
-                                onDoubleClick={(e) => {
-                                    const selection = window.getSelection();
-                                    const hasSelection = selection && !selection.isCollapsed;
-                                    const isTextSpan = e.target.tagName === 'SPAN';
+                    <div className="flex-1 relative overflow-hidden">
+                        {/* Bookmarks Panel (Left) - Fixed, outside scroll */}
+                        <SidePanel
+                            position="left"
+                            isOpen={showBookmarks}
+                            onClose={() => setShowBookmarks(false)}
+                            title="Bookmarks"
+                            width={leftPanelWidth}
+                            onResize={setLeftPanelWidth}
+                        >
+                            <BookmarksPanel
+                                outline={pdf?.outline || []}
+                                bookmarks={bookmarks}
+                                onNavigate={async (pageOrDest) => {
+                                    let targetPage;
 
-                                    // Ignore if there is a text selection (unless it's empty/collapsed)
-                                    // AND also check if the user "held" the second click (long press) which implies selection intent
-                                    const clickDuration = Date.now() - lastMouseDownTime.current;
-                                    if ((hasSelection && isTextSpan) || clickDuration > 300) return;
+                                    if (typeof pageOrDest === 'number') {
+                                        // Simple page number
+                                        targetPage = pageOrDest;
+                                    } else if (pageOrDest && pdf?.doc) {
+                                        // PDF destination object - need to resolve to page number
+                                        try {
+                                            let destArray = pageOrDest;
+                                            // If it's a string (named destination), look it up
+                                            if (typeof pageOrDest === 'string') {
+                                                destArray = await pdf.doc.getDestination(pageOrDest);
+                                            }
 
-                                    setSelectionBtn({ show: false, x: 0, y: 0 });
+                                            if (Array.isArray(destArray) && destArray[0]) {
+                                                const ref = destArray[0];
+                                                if (typeof ref === 'object' && ref !== null) {
+                                                    // Page reference object
+                                                    const pageIndex = await pdf.doc.getPageIndex(ref);
+                                                    targetPage = pageIndex + 1; // Convert to 1-indexed
+                                                } else if (typeof ref === 'number') {
+                                                    targetPage = ref + 1;
+                                                }
+                                            }
+                                        } catch (error) {
+                                            console.warn('Failed to resolve destination:', error);
+                                        }
+                                    }
 
-                                    const rect = e.currentTarget.getBoundingClientRect();
-                                    const x = ((e.clientX - rect.left) / rect.width) * 100;
-                                    const y = ((e.clientY - rect.top) / rect.height) * 100;
-
-                                    addComment(side, x, y);
-                                    if (selection && !isTextSpan) {
-                                        selection.removeAllRanges();
+                                    if (targetPage && targetPage >= 1 && targetPage <= numPages) {
+                                        if (viewMode === 'continuous') scrollToPage(targetPage);
+                                        else if (viewerRef.current) viewerRef.current.scrollTop = 0;
+                                        setPage(targetPage);
                                     }
                                 }}
-                            >
-                                {/* Interaction Shield: Move inside relative container to cover full scrollable area */}
-                                {activeComment && activeComment.side === side && commentText && commentText.trim() !== '' && (
-                                    <div
-                                        className="absolute inset-0 z-[69] cursor-default select-none bg-transparent"
-                                        onMouseDown={(e) => {
-                                            e.preventDefault();
-                                            e.stopPropagation();
-                                            setIsBlinking(true);
-                                            setTimeout(() => setIsBlinking(false), 600);
-                                        }}
-                                        onClick={(e) => {
-                                            e.stopPropagation();
-                                            setIsBlinking(true);
-                                            setTimeout(() => setIsBlinking(false), 600);
-                                        }}
-                                        onDoubleClick={(e) => {
-                                            e.stopPropagation();
-                                            setIsBlinking(true);
-                                            setTimeout(() => setIsBlinking(false), 600);
-                                        }}
-                                    />
-                                )}
-                                <div ref={singlePageContainerRef} style={{ position: 'relative' }} />
-                                {renderOverlayItems(page, comments, side, activeComment, setActiveComment, setCommentText, deleteComment, saveComment, commentText, selectionBtn, setSelectionBtn, addComment, addHighlight, setHoveredCommentId, hoveredCommentId, activeCommentRef, isBlinking)}
-                            </div>
-                        ) : (
-                            <div className="flex flex-col gap-4 items-center pb-[50vh] w-full relative">
-                                {/* Interaction Shield: Move inside relative container to cover full scrollable area */}
-                                {activeComment && activeComment.side === side && commentText && commentText.trim() !== '' && (
-                                    <div
-                                        className="absolute inset-0 z-[69] cursor-default select-none bg-transparent"
-                                        onMouseDown={(e) => {
-                                            e.preventDefault();
-                                            e.stopPropagation();
-                                            setIsBlinking(true);
-                                            setTimeout(() => setIsBlinking(false), 600);
-                                        }}
-                                        onClick={(e) => {
-                                            e.stopPropagation();
-                                            setIsBlinking(true);
-                                            setTimeout(() => setIsBlinking(false), 600);
-                                        }}
-                                        onDoubleClick={(e) => {
-                                            e.stopPropagation();
-                                            setIsBlinking(true);
-                                            setTimeout(() => setIsBlinking(false), 600);
-                                        }}
-                                    />
-                                )}
-                                {Array.from({ length: numPages }, (_, i) => i + 1).map(pageNum => (
-                                    <div
-                                        key={pageNum}
-                                        className="pdf-page-container relative bg-white shadow-lg transition-shadow duration-300 mx-auto"
-                                        style={{
-                                            width: 'fit-content',
-                                            minHeight: `${defaultPageHeight}px`,
-                                        }}
-                                        onDoubleClick={(e) => {
-                                            const selection = window.getSelection();
-                                            const hasSelection = selection && !selection.isCollapsed;
-                                            const isTextSpan = e.target.tagName === 'SPAN';
+                                onAddBookmark={addBookmark}
+                                onRemoveBookmark={removeBookmark}
+                                onRenameBookmark={renameBookmark}
+                                currentPage={page}
+                                numPages={numPages}
+                            />
+                        </SidePanel>
 
-                                            // Ignore if there is a text selection (unless it's empty/collapsed)
-                                            // AND also check if the user "held" the second click (long press) which implies selection intent
-                                            const clickDuration = Date.now() - lastMouseDownTime.current;
-                                            if ((hasSelection && isTextSpan) || clickDuration > 300) return;
+                        {/* Annotations Panel (Right) - Fixed, outside scroll */}
+                        <SidePanel
+                            position="right"
+                            isOpen={showAnnotations}
+                            onClose={() => setShowAnnotations(false)}
+                            title="Annotations"
+                            width={rightPanelWidth}
+                            onResize={setRightPanelWidth}
+                        >
+                            <AnnotationsPanel
+                                annotations={comments}
+                                side={side}
+                                onNavigate={(targetPage) => {
+                                    setPage(targetPage);
+                                    if (viewMode === 'continuous') scrollToPage(targetPage);
+                                }}
+                                onDelete={(id) => deleteComment?.(id)}
+                                onEdit={(id) => {
+                                    const comment = comments[id];
+                                    if (comment) {
+                                        setPage(comment.page);
+                                        if (viewMode === 'continuous') scrollToPage(comment.page);
+                                        setCommentText(comment.text || '');
+                                        setActiveComment(comment);
+                                    }
+                                }}
+                            />
+                        </SidePanel>
 
-                                            setSelectionBtn({ show: false, x: 0, y: 0 });
-                                            const rect = e.currentTarget.getBoundingClientRect();
-                                            const x = ((e.clientX - rect.left) / rect.width) * 100;
-                                            const y = ((e.clientY - rect.top) / rect.height) * 100;
+                        {/* Scrollable PDF Viewer */}
+                        <div
+                            ref={viewerRef}
+                            tabIndex={0}
+                            className={`h-full overflow-auto relative bg-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-400/20 ${viewMode === 'single' ? 'p-0 flex' : 'py-4 px-0 flex flex-col items-center'}`}
+                            style={{
+                                marginLeft: showBookmarks ? `${leftPanelWidth}px` : 0,
+                                marginRight: showAnnotations ? `${rightPanelWidth}px` : 0,
+                                transition: 'margin 0.05s ease',
+                            }}
+                            onScroll={handleScrollInternal}
+                            onMouseUp={handleMouseUp}
+                            onKeyDown={(e) => {
+                                if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+                                // Page navigation: Alt+Left/Right arrows only
+                                if (e.altKey && e.key === 'ArrowLeft') {
+                                    e.preventDefault();
+                                    const prev = Math.max(1, page - 1);
+                                    if (viewMode === 'continuous') scrollToPage(prev);
+                                    else if (viewerRef.current) viewerRef.current.scrollTop = 0;
+                                    setPage(prev);
+                                } else if (e.altKey && e.key === 'ArrowRight') {
+                                    e.preventDefault();
+                                    const next = Math.min(numPages, page + 1);
+                                    if (viewMode === 'continuous') scrollToPage(next);
+                                    else if (viewerRef.current) viewerRef.current.scrollTop = 0;
+                                    setPage(next);
+                                }
+                            }}
+                        >
+                            {viewMode === 'single' ? (
+                                <div
+                                    data-page={page}
+                                    className="pdf-page-container relative block m-auto bg-white shadow-lg w-fit"
+                                    onDoubleClick={(e) => {
+                                        const selection = window.getSelection();
+                                        const hasSelection = selection && !selection.isCollapsed;
+                                        const isTextSpan = e.target.tagName === 'SPAN';
 
-                                            addComment(side, x, y);
-                                            if (selection && !isTextSpan) {
-                                                selection.removeAllRanges();
-                                            }
-                                        }}
-                                    >
+                                        // Ignore if there is a text selection (unless it's empty/collapsed)
+                                        // AND also check if the user "held" the second click (long press) which implies selection intent
+                                        const clickDuration = Date.now() - lastMouseDownTime.current;
+                                        if ((hasSelection && isTextSpan) || clickDuration > 300) return;
+
+                                        setSelectionBtn({ show: false, x: 0, y: 0 });
+
+                                        const rect = e.currentTarget.getBoundingClientRect();
+                                        const x = ((e.clientX - rect.left) / rect.width) * 100;
+                                        const y = ((e.clientY - rect.top) / rect.height) * 100;
+
+                                        // Pass page number explicitly to the hook function
+                                        addComment(side, x, y, null, '', page);
+                                        if (selection && !isTextSpan) {
+                                            selection.removeAllRanges();
+                                        }
+                                    }}
+                                >
+                                    {/* Interaction Shield: Move inside relative container to cover full scrollable area */}
+                                    {activeComment && activeComment.side === side && commentText && commentText.trim() !== '' && (
                                         <div
-                                            ref={el => pageRefs.current[pageNum] = el}
-                                            data-page={pageNum}
+                                            className="absolute inset-0 z-active-comment-shield cursor-default select-none bg-transparent"
+                                            onMouseDown={(e) => {
+                                                e.preventDefault();
+                                                e.stopPropagation();
+                                                setIsBlinking(true);
+                                                setTimeout(() => setIsBlinking(false), 600);
+                                            }}
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                setIsBlinking(true);
+                                                setTimeout(() => setIsBlinking(false), 600);
+                                            }}
+                                            onDoubleClick={(e) => {
+                                                e.stopPropagation();
+                                                setIsBlinking(true);
+                                                setTimeout(() => setIsBlinking(false), 600);
+                                            }}
+                                        />
+                                    )}
+                                    <div ref={singlePageContainerRef} style={{ position: 'relative' }} />
+                                    <SelectionPopover
+                                        show={selectionBtn.show && (selectionBtn.page === page || !selectionBtn.page)}
+                                        x={selectionBtn.x}
+                                        y={selectionBtn.y}
+                                        pageNum={page}
+                                        highlightRect={selectionBtn.highlightRect}
+                                        highlightRects={selectionBtn.highlightRects}
+                                        selectedText={selectionBtn.selectedText}
+                                        side={side}
+                                        onHighlight={addHighlight}
+                                        onComment={addComment}
+                                        onClose={() => setSelectionBtn({ show: false, x: 0, y: 0, highlightRect: null, highlightRects: null, selectedText: '' })}
+                                    />
+                                    <AnnotationOverlay
+                                        pageNum={page}
+                                        comments={comments}
+                                        side={side}
+                                        hoveredCommentId={hoveredCommentId}
+                                        activeComment={activeComment}
+                                        onHoverComment={setHoveredCommentId}
+                                        onLeaveComment={() => setHoveredCommentId(null)}
+                                        onClickComment={(comment) => {
+                                            setActiveComment(comment);
+                                            setCommentText(comment.text);
+                                        }}
+                                    />
+                                </div>
+                            ) : (
+                                <div className="flex flex-col gap-4 items-center pb-[50vh] w-full relative">
+                                    {/* Note: Interaction shield removed from continuous mode - it was covering all pages */}
+                                    {Array.from({ length: numPages }, (_, i) => i + 1).map(pageNum => (
+                                        <div
+                                            key={pageNum}
+                                            className="pdf-page-container relative bg-white shadow-lg transition-shadow duration-300 mx-auto"
                                             style={{
                                                 width: 'fit-content',
-                                                height: visiblePages.current.has(pageNum) ? 'auto' : `${defaultPageHeight}px`,
                                                 minHeight: `${defaultPageHeight}px`,
-                                                overflow: 'hidden',
                                             }}
-                                        />
-                                        {renderOverlayItems(pageNum, comments, side, activeComment, setActiveComment, setCommentText, deleteComment, saveComment, commentText, selectionBtn, setSelectionBtn, addComment, addHighlight, setHoveredCommentId, hoveredCommentId, activeCommentRef, isBlinking)}
-                                    </div>
-                                ))}
-                            </div>
-                        )}
+                                            onDoubleClick={(e) => {
+                                                const selection = window.getSelection();
+                                                const hasSelection = selection && !selection.isCollapsed;
+                                                const isTextSpan = e.target.tagName === 'SPAN';
 
-                        {/* Active Comment Box - Rendered at viewer level to avoid page clipping */}
-                        {activeComment && activeComment.side === side && (() => {
-                            // Calculate position synchronously during render (no state/effect needed)
-                            const viewerPanel = viewerRef.current;
-                            if (!viewerPanel) return null;
+                                                // Ignore if there is a text selection (unless it's empty/collapsed)
+                                                // AND also check if the user "held" the second click (long press) which implies selection intent
+                                                const clickDuration = Date.now() - lastMouseDownTime.current;
+                                                if ((hasSelection && isTextSpan) || clickDuration > 300) return;
 
-                            let pageContainer;
-                            if (viewMode === 'continuous') {
-                                pageContainer = pageRefs.current[activeComment.page];
-                            } else {
-                                pageContainer = singlePageContainerRef.current?.closest('.pdf-page-container');
-                            }
-                            if (!pageContainer) return null;
+                                                setSelectionBtn({ show: false, x: 0, y: 0 });
+                                                const rect = e.currentTarget.getBoundingClientRect();
+                                                const x = ((e.clientX - rect.left) / rect.width) * 100;
+                                                const y = ((e.clientY - rect.top) / rect.height) * 100;
 
-                            const pageRect = pageContainer.getBoundingClientRect();
-                            const viewerRect = viewerPanel.getBoundingClientRect();
-
-                            // Calculate annotation position in SCREEN coordinates
-                            const annotationScreenX = pageRect.left + (activeComment.x / 100) * pageRect.width;
-                            const annotationScreenY = pageRect.top + (activeComment.y / 100) * pageRect.height;
-
-                            // Comment box dimensions
-                            const boxWidth = 250;
-                            const boxHeight = 120;
-                            const OFFSET = 14;
-                            const PADDING = 10;
-
-                            // Get precise layout metrics (excluding scrollbars and borders)
-                            const clientLeft = viewerPanel.clientLeft || 0;
-                            const clientTop = viewerPanel.clientTop || 0;
-
-                            // Usable viewport area in SCREEN coordinates
-                            const viewportTop = viewerRect.top + clientTop + PADDING;
-                            const viewportLeft = viewerRect.left + clientLeft + PADDING;
-                            const viewportBottom = viewerRect.top + clientTop + viewerPanel.clientHeight - PADDING;
-                            const viewportRight = viewerRect.left + clientLeft + viewerPanel.clientWidth - PADDING;
-
-                            // Calculate ideal position (centered below annotation)
-                            let boxScreenTop = annotationScreenY + OFFSET;
-                            let boxScreenLeft = annotationScreenX - boxWidth / 2;
-
-                            // Flip to above if would overflow bottom
-                            if (boxScreenTop + boxHeight > viewportBottom) {
-                                boxScreenTop = annotationScreenY - boxHeight - OFFSET;
-                            }
-
-                            // Clamp to visible area
-                            boxScreenTop = Math.max(viewportTop, Math.min(boxScreenTop, viewportBottom - boxHeight));
-                            boxScreenLeft = Math.max(viewportLeft, Math.min(boxScreenLeft, viewportRight - boxWidth));
-
-                            // Convert to content-relative coordinates for absolute positioning
-                            const boxLeft = boxScreenLeft - (viewerRect.left + clientLeft) + viewerPanel.scrollLeft;
-                            const boxTop = boxScreenTop - (viewerRect.top + clientTop) + viewerPanel.scrollTop;
-
-                            const finalStyle = {
-                                left: `${boxLeft}px`,
-                                top: `${boxTop}px`,
-                            };
-
-                            return (
-                                <div
-                                    ref={activeCommentRef}
-                                    className={`absolute bg-white rounded-none p-0 z-[80] min-w-[250px] border border-transparent ${isBlinking ? 'animate-border-blink' : ''}`}
-                                    style={{
-                                        ...finalStyle,
-                                        boxShadow: '0 0 20px rgba(0, 0, 0, 0.15), 0 0 2px rgba(0, 0, 0, 0.05)'
-                                    }}
-                                    onClick={(e) => e.stopPropagation()}
-                                    onDoubleClick={(e) => e.stopPropagation()}
-                                >
-                                    <div className="relative">
-                                        <button
-                                            onClick={() => setActiveComment(null)}
-                                            className="absolute top-0 right-0 h-[22px] w-[24px] flex items-center justify-center p-0 hover:bg-red-100 rounded-none text-gray-400 hover:text-red-500 transition-colors z-10 bg-white"
-                                            title="Close (Esc)"
-                                        >
-                                            <X className="w-4 h-4" />
-                                        </button>
-                                        <textarea
-                                            autoFocus
-                                            value={commentText}
-                                            onChange={(e) => setCommentText(e.target.value)}
-                                            onKeyDown={(e) => {
-                                                if (e.ctrlKey && e.key === 'Enter') {
-                                                    e.preventDefault();
-                                                    saveComment();
-                                                } else if (e.key === 'Escape') {
-                                                    e.preventDefault();
-                                                    setActiveComment(null);
-                                                } else if (e.ctrlKey && e.key === 'Delete') {
-                                                    e.preventDefault();
-                                                    deleteComment(activeComment.id);
-                                                    setActiveComment(null);
+                                                // Pass pageNum explicitly
+                                                addComment(side, x, y, null, '', pageNum);
+                                                if (selection && !isTextSpan) {
+                                                    selection.removeAllRanges();
                                                 }
                                             }}
-                                            placeholder="Add your comment..."
-                                            className="w-full pl-2 pr-7 py-[5px] border-0 resize-none focus:outline-none focus:ring-0 text-[13px] leading-relaxed"
-                                            rows={3}
-                                        />
-                                    </div>
-
-                                    <div className="flex justify-between items-end -m-px">
-                                        <button
-                                            onClick={() => {
-                                                deleteComment(activeComment.id);
-                                                setActiveComment(null);
-                                            }}
-                                            className="flex items-center justify-center h-[24px] w-10 text-red-500 hover:bg-red-50 transition-colors rounded-none"
-                                            title="Delete (Ctrl+Del)"
                                         >
-                                            <Trash2 className="w-4 h-4" />
-                                        </button>
-
-                                        <button
-                                            onClick={saveComment}
-                                            className="bg-blue-500 text-white hover:bg-blue-600 transition-colors flex items-center justify-center h-[24px] w-20 rounded-none"
-                                            title="Save (Ctrl+Enter)"
-                                        >
-                                            <Send className="w-4 h-4" />
-                                        </button>
-                                    </div>
+                                            <div
+                                                ref={el => pageRefs.current[pageNum] = el}
+                                                data-page={pageNum}
+                                                style={{
+                                                    width: 'fit-content',
+                                                    height: visiblePages.current.has(pageNum) ? 'auto' : `${defaultPageHeight}px`,
+                                                    minHeight: `${defaultPageHeight}px`,
+                                                    overflow: 'hidden',
+                                                }}
+                                            />
+                                            <SelectionPopover
+                                                show={selectionBtn.show && (selectionBtn.page === pageNum || !selectionBtn.page)}
+                                                x={selectionBtn.x}
+                                                y={selectionBtn.y}
+                                                pageNum={pageNum}
+                                                highlightRect={selectionBtn.highlightRect}
+                                                highlightRects={selectionBtn.highlightRects}
+                                                selectedText={selectionBtn.selectedText}
+                                                side={side}
+                                                onHighlight={addHighlight}
+                                                onComment={addComment}
+                                                onClose={() => setSelectionBtn({ show: false, x: 0, y: 0, highlightRect: null, highlightRects: null, selectedText: '' })}
+                                            />
+                                            <AnnotationOverlay
+                                                pageNum={pageNum}
+                                                comments={comments}
+                                                side={side}
+                                                hoveredCommentId={hoveredCommentId}
+                                                activeComment={activeComment}
+                                                onHoverComment={setHoveredCommentId}
+                                                onLeaveComment={() => setHoveredCommentId(null)}
+                                                onClickComment={(comment) => {
+                                                    setActiveComment(comment);
+                                                    setCommentText(comment.text);
+                                                }}
+                                            />
+                                        </div>
+                                    ))}
                                 </div>
-                            );
-                        })()}
+                            )}
+
+                            {/* Active Comment Box - Rendered at viewer level to avoid page clipping */}
+                            {activeComment && activeComment.side === side && (() => {
+                                // Calculate position synchronously during render (no state/effect needed)
+                                const viewerPanel = viewerRef.current;
+                                if (!viewerPanel) return null;
+
+                                let pageContainer;
+                                if (viewMode === 'continuous') {
+                                    pageContainer = pageRefs.current[activeComment.page];
+                                } else {
+                                    pageContainer = singlePageContainerRef.current?.closest('.pdf-page-container');
+                                }
+                                if (!pageContainer) return null;
+
+                                const pageRect = pageContainer.getBoundingClientRect();
+                                const viewerRect = viewerPanel.getBoundingClientRect();
+
+                                // Calculate annotation position in SCREEN coordinates
+                                const annotationScreenX = pageRect.left + (activeComment.x / 100) * pageRect.width;
+                                const annotationScreenY = pageRect.top + (activeComment.y / 100) * pageRect.height;
+
+                                // Comment box dimensions
+                                const boxWidth = 250;
+                                const boxHeight = 120;
+                                const OFFSET = 14;
+                                const PADDING = 10;
+
+                                // Get precise layout metrics (excluding scrollbars and borders)
+                                const clientLeft = viewerPanel.clientLeft || 0;
+                                const clientTop = viewerPanel.clientTop || 0;
+
+                                // Usable viewport area in SCREEN coordinates
+                                const viewportTop = viewerRect.top + clientTop + PADDING;
+                                const viewportLeft = viewerRect.left + clientLeft + PADDING;
+                                const viewportBottom = viewerRect.top + clientTop + viewerPanel.clientHeight - PADDING;
+                                const viewportRight = viewerRect.left + clientLeft + viewerPanel.clientWidth - PADDING;
+
+                                // Calculate ideal position (centered below annotation)
+                                let boxScreenTop = annotationScreenY + OFFSET;
+                                let boxScreenLeft = annotationScreenX - boxWidth / 2;
+
+                                // Flip to above if would overflow bottom
+                                if (boxScreenTop + boxHeight > viewportBottom) {
+                                    boxScreenTop = annotationScreenY - boxHeight - OFFSET;
+                                }
+
+                                // Clamp to visible area
+                                boxScreenTop = Math.max(viewportTop, Math.min(boxScreenTop, viewportBottom - boxHeight));
+                                boxScreenLeft = Math.max(viewportLeft, Math.min(boxScreenLeft, viewportRight - boxWidth));
+
+                                // Convert to content-relative coordinates for absolute positioning
+                                const boxLeft = boxScreenLeft - (viewerRect.left + clientLeft) + viewerPanel.scrollLeft;
+                                const boxTop = boxScreenTop - (viewerRect.top + clientTop) + viewerPanel.scrollTop;
+
+                                const finalStyle = {
+                                    left: `${boxLeft}px`,
+                                    top: `${boxTop}px`,
+                                };
+
+                                return (
+                                    <div
+                                        ref={activeCommentRef}
+                                        className={`absolute bg-white rounded-none p-0 z-active-comment-box min-w-[250px] border border-transparent ${isBlinking ? 'animate-border-blink' : ''}`}
+                                        style={{
+                                            ...finalStyle,
+                                            boxShadow: '0 0 20px rgba(0, 0, 0, 0.15), 0 0 2px rgba(0, 0, 0, 0.05)'
+                                        }}
+                                        onClick={(e) => e.stopPropagation()}
+                                        onDoubleClick={(e) => e.stopPropagation()}
+                                    >
+                                        <div className="relative">
+                                            <button
+                                                onClick={() => setActiveComment(null)}
+                                                className="absolute top-0 right-0 h-[22px] w-[24px] flex items-center justify-center p-0 hover:bg-red-100 rounded-none text-gray-400 hover:text-red-500 transition-colors z-10 bg-white"
+                                                title="Close (Esc)"
+                                            >
+                                                <X className="w-4 h-4" />
+                                            </button>
+                                            <textarea
+                                                autoFocus
+                                                value={commentText}
+                                                onChange={(e) => setCommentText(e.target.value)}
+                                                onKeyDown={(e) => {
+                                                    if (e.ctrlKey && e.key === 'Enter') {
+                                                        e.preventDefault();
+                                                        saveComment();
+                                                    } else if (e.key === 'Escape') {
+                                                        e.preventDefault();
+                                                        setActiveComment(null);
+                                                    } else if (e.ctrlKey && e.key === 'Delete') {
+                                                        e.preventDefault();
+                                                        deleteComment(activeComment.id);
+                                                        setActiveComment(null);
+                                                    }
+                                                }}
+                                                placeholder="Add your comment..."
+                                                className="w-full pl-2 pr-7 py-[5px] border-0 resize-none focus:outline-none focus:ring-0 text-[13px] leading-relaxed"
+                                                rows={3}
+                                            />
+                                        </div>
+
+                                        <div className="flex justify-between items-end -m-px">
+                                            <button
+                                                onClick={() => {
+                                                    deleteComment(activeComment.id);
+                                                    setActiveComment(null);
+                                                }}
+                                                className="flex items-center justify-center h-[24px] w-10 text-red-500 hover:bg-red-50 transition-colors rounded-none"
+                                                title="Delete (Ctrl+Del)"
+                                            >
+                                                <Trash2 className="w-4 h-4" />
+                                            </button>
+
+                                            <button
+                                                onClick={saveComment}
+                                                className="bg-blue-500 text-white hover:bg-blue-600 transition-colors flex items-center justify-center h-[24px] w-20 rounded-none"
+                                                title="Save (Ctrl+Enter)"
+                                            >
+                                                <Send className="w-4 h-4" />
+                                            </button>
+                                        </div>
+                                    </div>
+                                );
+                            })()}
+                        </div>
                     </div>
                 )}
         </div>
@@ -2603,168 +2816,6 @@ const PDFViewer = forwardRef(({
 
 PDFViewer.displayName = 'PDFViewer';
 
-function useClickOutside(ref, activeComment, commentText, setActiveComment, setIsBlinking, side) {
-    useEffect(() => {
-        if (!activeComment || activeComment.side !== side) return;
 
-        const handleClickOutside = (event) => {
-            // Clicked outside?
-            if (ref.current && !ref.current.contains(event.target)) {
-                // Ignore if clicking on the OTHER PDF viewer
-                const otherViewer = event.target.closest('[data-pdf-viewer]');
-                if (otherViewer && otherViewer.getAttribute('data-side') !== side) {
-                    return;
-                }
-
-                if (!commentText || commentText.trim() === '') {
-                    // Empty? Close it
-                    setActiveComment(null);
-                } else {
-                    // Not empty? Blink it
-                    setIsBlinking(true);
-                    setTimeout(() => setIsBlinking(false), 600); // Match animation duration (0.2s * 3)
-                }
-            }
-        };
-
-        document.addEventListener('mousedown', handleClickOutside);
-        return () => {
-            document.removeEventListener('mousedown', handleClickOutside);
-        };
-    }, [activeComment, commentText, ref, setActiveComment, setIsBlinking, side]);
-}
-
-const renderOverlayItems = (pageNum, comments, side, activeComment, setActiveComment, setCommentText, deleteComment, saveComment, commentText, selectionBtn, setSelectionBtn, addComment, addHighlight, setHoveredCommentId, hoveredCommentId, activeCommentRef, isBlinking, activeSearchResult) => {
-    return (
-        <>
-
-
-            {selectionBtn.show && (selectionBtn.page === pageNum || (!selectionBtn.page && true)) && (
-                <div
-                    className="absolute bg-white border border-gray-200 shadow-xl rounded-none z-50 flex overflow-hidden transform -translate-x-1/2 mt-1"
-                    style={{
-                        left: `${selectionBtn.x}%`,
-                        top: `${selectionBtn.y}%`,
-                    }}
-                    onDoubleClick={(e) => e.stopPropagation()}
-                >
-                    <button
-                        className="px-3 py-1.5 hover:bg-yellow-50 text-yellow-700 transition-colors border-r border-gray-100 flex items-center justify-center"
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            addHighlight(side, selectionBtn.x, selectionBtn.y, selectionBtn.highlightRects || [selectionBtn.highlightRect], selectionBtn.selectedText, selectionBtn.page);
-                            setSelectionBtn({ show: false, x: 0, y: 0, highlightRect: null, highlightRects: null, selectedText: '' });
-                            window.getSelection()?.removeAllRanges();
-                        }}
-                        title="Highlight"
-                    >
-                        <Highlighter className="w-4 h-4" />
-                    </button>
-                    <button
-                        className="px-3 py-1.5 hover:bg-blue-50 text-blue-600 text-xs font-medium flex items-center gap-1.5 transition-colors"
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            addComment(side, selectionBtn.x, selectionBtn.y, selectionBtn.highlightRects || [selectionBtn.highlightRect], selectionBtn.selectedText, selectionBtn.page);
-                            setSelectionBtn({ show: false, x: 0, y: 0, highlightRect: null, highlightRects: null, selectedText: '' });
-                            window.getSelection()?.removeAllRanges();
-                        }}
-                        title="Add comment"
-                    >
-                        <MessageSquare className="w-3.5 h-3.5" />
-                        Comment
-                    </button>
-                </div>
-            )}
-
-            {Object.values(comments)
-                .filter(c => c.side === side && c.page === pageNum)
-                .map(comment => (
-                    <React.Fragment key={comment.id}>
-                        {(comment.highlightRects && comment.highlightRects.length > 0) ? (
-                            <div
-                                className="absolute inset-0 pointer-events-none z-[20] opacity-40 hover:opacity-60 transition-opacity"
-                                style={{ width: '100%', height: '100%' }}
-                            >
-                                {comment.highlightRects.map((rect, idx) => (
-                                    <div
-                                        key={`${comment.id}-${idx}`}
-                                        className="absolute bg-yellow-400 cursor-pointer pointer-events-auto"
-                                        style={{
-                                            left: `${rect.left}%`,
-                                            top: `${rect.top}%`,
-                                            width: `${rect.width}%`,
-                                            height: `${rect.height}%`,
-                                        }}
-                                        onMouseEnter={() => setHoveredCommentId(comment.id)}
-                                        onMouseLeave={() => setHoveredCommentId(null)}
-                                        onClick={(e) => {
-                                            e.stopPropagation();
-                                            setActiveComment(comment);
-                                            setCommentText(comment.text);
-                                        }}
-                                    />
-                                ))}
-                            </div>
-                        ) : comment.highlightRect ? (
-                            <div
-                                className="absolute bg-yellow-400 opacity-40 hover:opacity-60 transition-opacity cursor-pointer z-[20]"
-                                style={{
-                                    left: `${comment.highlightRect.left}%`,
-                                    top: `${comment.highlightRect.top}%`,
-                                    width: `${comment.highlightRect.width}%`,
-                                    height: `${comment.highlightRect.height}%`,
-                                }}
-                                onMouseEnter={() => setHoveredCommentId(comment.id)}
-                                onMouseLeave={() => setHoveredCommentId(null)}
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    setActiveComment(comment);
-                                    setCommentText(comment.text);
-                                }}
-                            />
-                        ) : (
-                            <div
-                                className="absolute text-yellow-600 opacity-70 hover:opacity-100 transition-opacity cursor-pointer z-[30]"
-                                style={{
-                                    left: `${comment.x}%`,
-                                    top: `${comment.y}%`,
-                                    transform: 'translate(-50%, -50%)'
-                                }}
-                                onMouseEnter={() => setHoveredCommentId(comment.id)}
-                                onMouseLeave={() => setHoveredCommentId(null)}
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    setActiveComment(comment);
-                                    setCommentText(comment.text);
-                                }}
-                            >
-                                <MessageSquare className="w-5 h-5 fill-current" />
-                            </div>
-                        )}
-
-                        {hoveredCommentId === comment.id && (!activeComment || activeComment.id !== comment.id) && (
-                            <div
-                                className="absolute bg-white border border-gray-300 rounded-none shadow-xl p-2 text-xs max-w-[200px] z-[60] pointer-events-none"
-                                style={{
-                                    left: `${comment.x}%`,
-                                    top: `${comment.y}%`,
-                                    transform: 'translate(-50%, calc(-100% - 10px))'
-                                }}
-                            >
-                                <div className="flex justify-between items-center mb-1 border-b border-gray-100 pb-1">
-                                    <span className="font-bold text-gray-500">{comment.author || 'User'}</span>
-                                </div>
-                                <p className="line-clamp-4 text-gray-800 leading-relaxed">
-                                    {comment.text}
-                                </p>
-                            </div>
-                        )}
-                    </React.Fragment>
-                ))}
-
-
-        </>
-    );
-};
 
 export default PDFViewer;

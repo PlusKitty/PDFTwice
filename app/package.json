@@ -1,7 +1,7 @@
 {
-  "name": "pdf-twice",
+  "name": "twice-pdf",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.1.0",
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "scripts": {
@@ -10,7 +10,10 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "predeploy": "npm run build",
-    "deploy": "gh-pages -d dist --repo https://github.com/PlusKitty/PDFTwice.git"
+    "deploy": "gh-pages -d dist --repo https://github.com/PlusKits/Twice-PDF.git",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "dependencies": {
     "lucide-react": "^0.562.0",
@@ -21,6 +24,8 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@tauri-apps/api": "^2.9.1",
+    "@tauri-apps/cli": "^2.9.6",
     "@types/react": "^19.2.5",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
