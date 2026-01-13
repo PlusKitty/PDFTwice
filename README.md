@@ -24,7 +24,7 @@ A lightweight PDF viewer and annotator with synced side-by-side view. Built for 
 - **View modes**: Switch between page-by-page rendering or continuous scroll
 - **Session recovery**: Comments get autosaved and restored when you come back
 - **Accessibility**: Show alt text on hover, with an optional visual indicator
-- **Automation friendly**: Load remote and local PDFs on the web version like this: `?a=doc1.pdf&b=doc2.pdf` or use command line arguments with the desktop app.
+- **Automation friendly**: Load remote and local PDFs on the web version like this: `?a=doc1.pdf&b=doc2.pdf` or use command line arguments with the desktop app
 
 ### 💬 Annotations & Review
 
@@ -36,9 +36,9 @@ A lightweight PDF viewer and annotator with synced side-by-side view. Built for 
 ### 🖥️ Desktop App
 Twice PDF is available as a native Windows application powered by **Tauri**.
 - **CLI Support**: Open PDFs via command line: `Twice-PDF.exe doc1.pdf doc2.pdf`
-- **Native I/O**: Direct file access including "save to source" functionality with configurable naming patterns.
-- **Fully offline**: No online capabilities necessary to view and save PDFs.
-- **Minimal footprint**: Tauri uses the OS native web viewer, avoiding Electron-like embedding for a 95% smaller bundle size, 60-90% less memory usage, and automatic browser updates. The Windows app is **under 15 MB**!
+- **Native I/O**: Direct file access including "save to source" functionality with configurable naming patterns
+- **Fully offline**: No online capabilities necessary to view and save PDFs
+- **Minimal footprint**: Tauri uses the OS native web viewer, avoiding Electron-like embedding for a 95% smaller bundle size, 60-90% less memory usage, and automatic browser updates The Windows app is **under 15 MB**!
 
 ---
 
@@ -162,10 +162,10 @@ See [LICENSE](LICENSE) for full details.
 See [CHANGELOG.md](CHANGELOG.md) for complete version history.
 
 **Latest Updates (January 2026):**
-- **Desktop Support**: Native Windows app with Tauri (CLI args, native file access).
-- **Accessibility**: Alt text extraction, visualization, and fallback heuristics.
-- **Architecture**: Major refactor into 25+ modular components.
-- **Panels**: New Bookmarks and Annotations sidebars.
+- **Desktop Support**: Native Windows app with Tauri (CLI args, native file access)
+- **Accessibility**: Alt text extraction, visualization, and fallback heuristics
+- **Architecture**: Major refactor into 25+ modular components
+- **Panels**: New Bookmarks and Annotations sidebars
 
 -----
 ### Screenshots 
