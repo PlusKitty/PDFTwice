@@ -1205,6 +1205,7 @@ export default function SideBySidePDF() {
                             loadPDFFromURL(cleanUrl, 'left');
                         }
                     }}
+                    onLoadFromPath={(path) => loadPdfFromPath(path, 'left')}
                     onFitToPage={() => handleFitToPageSync('left')}
                     isLoading={isUrlLoading.left}
                     exportSettings={exportSettings}
@@ -1265,6 +1266,7 @@ export default function SideBySidePDF() {
                             loadPDFFromURL(cleanUrl, 'right');
                         }
                     }}
+                    onLoadFromPath={(path) => loadPdfFromPath(path, 'right')}
                     onFitToPage={() => handleFitToPageSync('right')}
                     isLoading={isUrlLoading.right}
                     // Scale Settings (passed but only Left side triggers settings menu changes usually, but good for consistency)

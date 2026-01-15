@@ -162,6 +162,7 @@ const PDFViewer = forwardRef(({
     setAuthorName,
     onClose,
     onLoadFromUrl,
+    onLoadFromPath, // Tauri: load from file path (native dialog)
     onFitToPage,
     isLoading = false,
     viewMode = 'single', // 'single' | 'continuous'
@@ -2398,6 +2399,7 @@ const PDFViewer = forwardRef(({
                 !pdf ? (
                     <UploadZone
                         onUpload={onUpload}
+                        onLoadFromPath={onLoadFromPath}
                         onLoadFromUrl={onLoadFromUrl}
                         isLoading={isLoading}
                         isDragging={isDragging}

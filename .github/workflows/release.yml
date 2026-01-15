@@ -44,8 +44,8 @@ jobs:
             
             | File | Description |
             |------|-------------|
-            | `Twice-PDF.exe` | **Portable** - Just download and run |
-            | `Twice PDF_*_x64-setup.exe` | **Installer** - For older Windows without WebView2 |
+            | `twice-pdf.exe` | **Portable** - Just download and run |
+            | `twice-pdf_*_x64-setup.exe` | **Installer** - For older Windows without WebView2 |
             
             See [CHANGELOG.md](https://github.com/PlusKits/Twice-PDF/blob/main/CHANGELOG.md) for details.
           releaseDraft: true
@@ -56,6 +56,6 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           draft: true
-          files: app/src-tauri/target/release/Twice PDF.exe
+          files: app/src-tauri/target/release/twice-pdf.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

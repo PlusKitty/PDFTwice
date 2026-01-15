@@ -6,12 +6,14 @@ import { Upload, Loader2 } from 'lucide-react';
  * 
  * Features:
  * - File upload via click or drag-drop
+ * - Uses native Tauri file dialog when available (provides full path for "Show in folder")
  * - URL loading (remote or local bridge)
  * - Loading state indicator
  * - Respects environment flags for remote/local options
  */
 const UploadZone = ({
     onUpload,
+    onLoadFromPath, // New: callback for loading via file path (Tauri)
     onLoadFromUrl,
     isLoading = false,
     isDragging = false,
@@ -22,11 +24,35 @@ const UploadZone = ({
     // Check environment flags
     const allowRemote = import.meta.env.VITE_ENABLE_REMOTE_PDFS !== 'false';
     const allowLocal = import.meta.env.VITE_ENABLE_LOCAL_BRIDGE !== 'false';
+    const isTauri = !!window.__TAURI__?.core?.invoke;
 
     let placeholder = "";
     if (allowRemote && allowLocal) placeholder = "https://... or folder/file.pdf";
     else if (allowRemote) placeholder = "https://...";
     else if (allowLocal) placeholder = "folder/file.pdf";
+
+    // Handle upload click - use native dialog in Tauri for full path access
+    const handleUploadClick = async () => {
+        if (isLoading) return;
+
+        if (isTauri && onLoadFromPath) {
+            try {
+                const dialog = window.__TAURI__?.dialog;
+                if (dialog?.open) {
+                    const selected = await dialog.open({
+                        filters: [{ name: 'PDF', extensions: ['pdf'] }],
+                        multiple: false,
+                    });
+                    if (selected) {
+                        // Tauri dialog returns the full path
+                        onLoadFromPath(selected);
+                    }
+                }
+            } catch (err) {
+                console.error('Failed to open file dialog:', err);
+            }
+        }
+    };
 
     return (
         <div
@@ -36,25 +62,42 @@ const UploadZone = ({
             onDragLeave={onDragLeave}
             onDrop={onDrop}
         >
-            {/* File upload */}
-            <label
-                className={`cursor-pointer flex flex-col items-center gap-3 p-8 border-2 border-dashed rounded-none transition-colors ${isLoading
-                    ? 'border-gray-200 bg-gray-50 cursor-wait'
-                    : 'border-gray-400 hover:border-blue-500 hover:bg-blue-50'
-                    }`}
-            >
-                <Upload className={`w-12 h-12 ${isLoading ? 'text-gray-300' : 'text-gray-400'}`} />
-                <span className={`font-medium ${isLoading ? 'text-gray-400' : 'text-gray-600'}`}>
-                    {isLoading ? 'Uploading PDF...' : 'Upload PDF'}
-                </span>
-                <input
-                    type="file"
-                    accept="application/pdf"
-                    onChange={onUpload}
-                    className="hidden"
+            {/* File upload - Tauri uses onClick for native dialog, web uses input */}
+            {isTauri ? (
+                <button
+                    type="button"
+                    onClick={handleUploadClick}
                     disabled={isLoading}
-                />
-            </label>
+                    className={`cursor-pointer flex flex-col items-center gap-3 p-8 border-2 border-dashed rounded-none transition-colors ${isLoading
+                        ? 'border-gray-200 bg-gray-50 cursor-wait'
+                        : 'border-gray-400 hover:border-blue-500 hover:bg-blue-50'
+                        }`}
+                >
+                    <Upload className={`w-12 h-12 ${isLoading ? 'text-gray-300' : 'text-gray-400'}`} />
+                    <span className={`font-medium ${isLoading ? 'text-gray-400' : 'text-gray-600'}`}>
+                        {isLoading ? 'Uploading PDF...' : 'Upload PDF'}
+                    </span>
+                </button>
+            ) : (
+                <label
+                    className={`cursor-pointer flex flex-col items-center gap-3 p-8 border-2 border-dashed rounded-none transition-colors ${isLoading
+                        ? 'border-gray-200 bg-gray-50 cursor-wait'
+                        : 'border-gray-400 hover:border-blue-500 hover:bg-blue-50'
+                        }`}
+                >
+                    <Upload className={`w-12 h-12 ${isLoading ? 'text-gray-300' : 'text-gray-400'}`} />
+                    <span className={`font-medium ${isLoading ? 'text-gray-400' : 'text-gray-600'}`}>
+                        {isLoading ? 'Uploading PDF...' : 'Upload PDF'}
+                    </span>
+                    <input
+                        type="file"
+                        accept="application/pdf"
+                        onChange={onUpload}
+                        className="hidden"
+                        disabled={isLoading}
+                    />
+                </label>
+            )}
 
             {/* URL loading section */}
             {(allowRemote || allowLocal) && (
@@ -98,3 +141,4 @@ const UploadZone = ({
 };
 
 export default UploadZone;
+
